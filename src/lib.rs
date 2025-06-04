@@ -267,27 +267,27 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
       let bytes = assemble(address, architecture, assembly)?;
       let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
-      println!("hook_info {:X?}", hook_info);
+      // println!("hook_info {:X?}", hook_info);
       owned_mem.hooks.push(hook_info.clone());
       owned_mems.clone().write()[mem_index] = owned_mem.clone();
       // println!("{:X?}", owned_mems.clone().unwrap().read());
-      println!("Appended {:X?}", owned_mem);
+      // println!("Appended {:X?}", owned_mem);
     } else {
       let mem = alloc(module_base)?;
       let bytes = assemble(mem.address, architecture, assembly)?;
       let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
-      println!("hook_info {:X?}", hook_info);
+      // println!("hook_info {:X?}", hook_info);
       owned_mem.hooks.push(hook_info.clone());
       owned_mems.write().push(owned_mem.clone());
       // println!("{:X?}", owned_mems.clone().unwrap().read());
-      println!("Allocated {:X?}", owned_mem);
+      // println!("Allocated {:X?}", owned_mem);
     }
   } else {
     let mem = alloc(module_base)?;
     let bytes = assemble(mem.address, architecture, assembly)?;
     insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
-    println!("hook_info {:X?}", hook_info);
+    // println!("hook_info {:X?}", hook_info);
     // println!("No owned memory provided {:X?}", owned_mem);
   }
   Ok(())
