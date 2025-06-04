@@ -3,28 +3,6 @@ use parking_lot::RwLock;
 use std::{ffi::CString, mem::zeroed, ptr::{null, null_mut}, sync::{Arc, OnceLock}};
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
-// #[macro_export]
-// macro_rules! assemble_1{
-//   ($obj:ident, $instr:tt $($dst:expr)? $(, $src:expr)* ; $($rest:tt)* ) => {
-//     $obj.$instr($($dst)? $(, $src)*).expect("Failed assembling instrucitons!");
-//     assemble_1!($obj, $($rest)* )
-//     };
-//     ($obj:ident, $instr:tt $size:tt ptr [ $dst:expr ] $(, $src:tt)* ; $($rest:tt)* ) => {
-//       $obj.$instr(paste::paste!([<$size _ptr>] ) ($dst) $(, $src)*).expect("Failed assembling instrucitons!");
-//       assemble_1!($obj, $($rest)* )
-//       };
-//     ($obj:ident, $instr:tt $dst:expr $(, $size:tt ptr [ $src:expr ])? ; $($rest:tt)* ) => {
-//       $obj.$instr( $dst $(, paste::paste!([<$size _ptr>]) ($src))?).expect("Failed assembling instrucitons!");
-//       assemble_1!($obj, $($rest)* )
-//     };
-//   ($obj:ident, $labelname:tt : $($rest:tt)* ) => {
-//     //a.mov ptr(rax);
-//     $obj.set_label(&mut $labelname).expect("Failed assembling instrucitons!");
-//     assemble_1!($obj, $($rest)* )
-//     };
-//   ($obj:ident, ) => {};
-// }
-
 #[macro_export]
 macro_rules! assemble_1 {
     // 1) Special case: “nop, $count ; …”
@@ -69,23 +47,11 @@ macro_rules! assemble_1 {
 }
 
 #[macro_export]
-macro_rules! assemble_2 {
-    ($($tt:tt)*) => {
-        |assembler| {
-            use iced_x86::code_asm::*;
-            use crate::assemble_1;
-            crate::assemble_1!(assembler,
-                $($tt)*
-            );
-        };
-    };
-}
-
-#[macro_export]
 macro_rules! assemble {
     ($($tt:tt)*) => {
         std::sync::Arc::new(move |assembler: &mut iced_x86::code_asm::CodeAssembler|  {
             use iced_x86::code_asm::*;
+            use crate::assemble_1;
             crate::assemble_1!(assembler,
                 $($tt)*
             );
@@ -343,8 +309,8 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
   } else {
     let mem = alloc(module_base).unwrap();
     let bytes = assemble(mem.address, architecture, assembly);
-    let owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
-    println!("No owned memory provided {:X?}", owned_mem);
+    insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
+    // println!("No owned memory provided {:X?}", owned_mem);
   }
 }
 
@@ -548,22 +514,22 @@ fn get_jump_size(src_address: usize, dst_address: usize) -> usize {
   }
 }
 
-fn get_jump_offset(src_address: usize, dst_address: usize) -> usize {
+fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
   let jump_size = get_jump_size(src_address, dst_address);
 
   if jump_size == 14 {
-    return dst_address;
+    return dst_address as isize;
   }
 
-  let offset = if src_address < dst_address {
+  let offset = if (src_address as isize) < (dst_address as isize) {
     println!("Jumping backward: {:#x}", src_address - dst_address);
-    src_address - dst_address
+    src_address as isize - dst_address as isize
   } else {
     println!("Jumping forward: {:#x}", dst_address - src_address);
-    dst_address - src_address - jump_size
+    dst_address as isize - src_address as isize - jump_size as isize
   };
 
-  offset
+  offset as isize
 }
 
 static ARCHITECTURE: OnceLock<u32> = OnceLock::new();
