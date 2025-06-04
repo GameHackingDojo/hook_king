@@ -451,6 +451,7 @@ fn place_bytes(address: usize, bytes: Vec<u8>) {
 
 /// offset is the length of the bytes placed before it
 fn place_nops(address: usize, required_nops: usize, offset: usize) {
+  dbg!(address);
   let address = address as *mut u8;
   let address = unsafe { std::slice::from_raw_parts_mut(address, required_nops + offset) };
 
