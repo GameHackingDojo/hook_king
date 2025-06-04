@@ -1,6 +1,6 @@
-use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, code_asm::*};
+use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 use parking_lot::RwLock;
-use std::{ffi::CString, mem::zeroed, ptr::{null, null_mut}, sync::{Arc, OnceLock}};
+use std::{ffi::CString, mem::zeroed, ptr::{null, null_mut}, sync::{Arc, OnceLock}, thread::sleep, time::Duration, usize};
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
 #[macro_export]
@@ -62,6 +62,9 @@ macro_rules! assemble {
 const PAGE_SIZE: usize = 0x1000;
 const SAFETY: usize = 0x10;
 
+struct MyTraitOptions;
+impl SpecializedFormatterTraitOptions for MyTraitOptions {}
+
 #[derive(Clone, Default, Debug)]
 pub struct OwnedMem {
   pub hooks: Vec<HookInfo>,
@@ -112,7 +115,7 @@ pub struct HookInfo {
 }
 
 impl std::fmt::Debug for HookInfo {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("HookInfo").field("name", &self.name).field("address", &self.address).field("typ", &self.typ).field("assembly", &"").finish() }
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("HookInfo").field("name", &self.name).field("address", &format!("{:016X?}", &self.address)).field("typ", &self.typ).field("assembly", &opcode_display(arch(), self.assembly.as_ref())).finish() }
 }
 
 impl Default for HookInfo {
@@ -220,13 +223,14 @@ pub enum HookType {
 ///);
 /// ```
 
-// pub unsafe fn asm_hook(name: &str, address: usize, hook_type: HookType, owned_mems: Option<Arc<Mutex<Vec<OwnedMem>>>>, assembly: impl Fn(&mut CodeAssembler)) {
+// #[cfg(feature = "parking-lot")]
+// #[cfg(feature = "std-lock")]
 pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<OwnedMem>>>>) -> Result<(), Box<dyn std::error::Error>> {
   let name = hook_info.name.clone();
   let address = hook_info.address;
   let hook_type = hook_info.typ;
   let assembly = hook_info.assembly.as_ref();
-
+  let architecture = arch();
   let module_base = module_base(None);
 
   if name.len() < 5 {
@@ -238,45 +242,16 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
     panic!("Not a valid address! {address:#X}");
   }
 
-  let architecture = arch();
-
-  let mut original_instructions_size = 0;
-  let protection_size = 100;
-  let mut required_nops = 0;
-  let original_bytes = address as *mut u8;
-  let original_bytes = unsafe { std::slice::from_raw_parts_mut(original_bytes, protection_size) };
-
   if hook_type == HookType::NoAlloc {
-    let mut old_protection = 0;
-    let old_protection: *mut u32 = &mut old_protection;
-    unsafe { VirtualProtect(address as _, protection_size, PAGE_EXECUTE_READWRITE, old_protection) };
+    unprotect(address);
 
-    let mut assembler = CodeAssembler::new(architecture).expect("Failed at constructing CodeAssembler");
-    assembly(&mut assembler);
-    let assembled_bytes = assembler.assemble(address as u64).expect("Failed at assembling CodeAssembler");
-    let bytes = assembled_bytes;
+    let bytes = assemble(address, architecture, assembly).unwrap();
+    let instr_info = instruction_info(address, bytes.len(), architecture);
+    let required_nops = get_required_nops(instr_info.clone(), 0);
 
-    let mut decoder = Decoder::with_ip(architecture, &*original_bytes, address as u64, DecoderOptions::NONE);
-    let mut instruction = Instruction::default();
-    let mut original_instructions = Vec::new();
-    while decoder.can_decode() {
-      decoder.decode_out(&mut instruction);
-      original_instructions_size += instruction.len();
-      original_instructions.push(instruction);
-      if original_instructions_size >= bytes.len() {
-        required_nops = (original_instructions_size).abs_diff(bytes.len());
-        break;
-      }
-    }
-    if required_nops != 0 {
-      for count in 0..required_nops {
-        (*original_bytes)[count + bytes.len()] = 0x90;
-      }
-    }
+    place_nops(address, required_nops - bytes.len(), bytes.len());
+    place_bytes(address, bytes);
 
-    for index in 0..bytes.len() {
-      (*original_bytes)[index] = bytes[index];
-    }
     return Ok(());
   }
 
@@ -292,6 +267,7 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
       let bytes = assemble(address, architecture, assembly)?;
       let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
+      println!("hook_info {:X?}", hook_info);
       owned_mem.hooks.push(hook_info.clone());
       owned_mems.clone().write()[mem_index] = owned_mem.clone();
       // println!("{:X?}", owned_mems.clone().unwrap().read());
@@ -301,6 +277,7 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
       let bytes = assemble(mem.address, architecture, assembly)?;
       let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
+      println!("hook_info {:X?}", hook_info);
       owned_mem.hooks.push(hook_info.clone());
       owned_mems.write().push(owned_mem.clone());
       // println!("{:X?}", owned_mems.clone().unwrap().read());
@@ -310,6 +287,7 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
     let mem = alloc(module_base)?;
     let bytes = assemble(mem.address, architecture, assembly)?;
     insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
+    println!("hook_info {:X?}", hook_info);
     // println!("No owned memory provided {:X?}", owned_mem);
   }
   Ok(())
@@ -406,38 +384,63 @@ fn assemble(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssemb
 }
 
 #[derive(Clone, Debug, Default)]
-struct InstructionInfo {
+struct InstructionsInfo {
+  pub opcodes: Vec<String>,
+  pub instrs: Vec<Instruction>,
   pub bytes: Vec<u8>,
-  pub nops: usize,
 }
 
 /// returns the size of the original instruction(s) and required nopes if needed
-fn instruction_info(address: usize, architecture: u32, bytes: Vec<u8>) -> InstructionInfo {
-  let protection_size = 100;
+fn instruction_info(address: usize, length: usize, architecture: u32) -> InstructionsInfo {
+  let bytes = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, 100) };
 
-  let mut original_instructions_size = 0;
-  let original_bytes = address as *mut u8;
-  let original_bytes = unsafe { std::slice::from_raw_parts_mut(original_bytes, protection_size) };
+  let mut instrs_size = 0;
+  let mut opcodes = Vec::new();
 
-  let mut required_nops = 0;
-
-  let mut decoder = Decoder::with_ip(architecture, &*original_bytes, address as u64, DecoderOptions::NONE);
-  let mut instruction = Instruction::default();
-  let mut original_instructions = Vec::new();
+  let mut decoder = Decoder::with_ip(architecture, &bytes, address as u64, DecoderOptions::NONE);
+  let mut formatter = SpecializedFormatter::<MyTraitOptions>::new();
+  let mut formated_instr = String::new();
+  let mut instr = Instruction::default();
+  let mut instrs = Vec::new();
   while decoder.can_decode() {
-    decoder.decode_out(&mut instruction);
-    original_instructions_size += instruction.len();
-    original_instructions.push(instruction);
-    if original_instructions_size >= bytes.len() {
-      required_nops = (original_instructions_size).abs_diff(bytes.len());
+    decoder.decode_out(&mut instr);
+
+    formated_instr.clear();
+    formatter.format(&instr, &mut formated_instr);
+    opcodes.push(formated_instr.clone());
+
+    instrs_size += instr.len();
+    instrs.push(instr);
+
+    if instrs_size >= length {
       break;
     }
   }
 
-  let block = InstructionBlock::new(&original_instructions, address as u64 + bytes.len() as u64);
-  let original_instructions_bytes = BlockEncoder::encode(decoder.bitness(), block, BlockEncoderOptions::NONE).expect("Failed at encoding BlockEncoder").code_buffer;
+  let block = InstructionBlock::new(&instrs, address as u64 + bytes.len() as u64);
+  let instrs_bytes = BlockEncoder::encode(decoder.bitness(), block, BlockEncoderOptions::NONE).expect("Failed at encoding BlockEncoder").code_buffer;
 
-  return InstructionInfo { bytes: original_instructions_bytes, nops: required_nops };
+  return InstructionsInfo { opcodes, instrs, bytes: instrs_bytes };
+}
+
+fn opcode_display(architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> Vec<String> {
+  let mut assembler = CodeAssembler::new(architecture).unwrap();
+
+  // Apply the assembly function
+  assembly(&mut assembler);
+
+  // Constructing formmatter
+  let mut formatter = SpecializedFormatter::<MyTraitOptions>::new();
+  let mut formated_instr = String::new();
+
+  // Convert to string
+  let mut opcodes = Vec::new();
+  for instr in assembler.instructions() {
+    formated_instr.clear();
+    formatter.format(&instr, &mut formated_instr);
+    opcodes.push(formated_instr.clone());
+  }
+  opcodes
 }
 
 fn place_bytes(address: usize, bytes: Vec<u8>) {
@@ -450,13 +453,12 @@ fn place_bytes(address: usize, bytes: Vec<u8>) {
 }
 
 /// offset is the length of the bytes placed before it
-fn place_nops(address: usize, required_nops: usize, offset: usize) {
-  dbg!(address);
+fn place_nops(address: usize, length: usize, offset: usize) {
   let address = address as *mut u8;
-  let address = unsafe { std::slice::from_raw_parts_mut(address, required_nops + offset) };
+  let address = unsafe { std::slice::from_raw_parts_mut(address, length + offset) };
 
-  if required_nops != 0 {
-    for i in 0..required_nops {
+  if length != 0 {
+    for i in 0..length {
       (*address)[i + offset] = 0x90;
     }
   }
@@ -484,25 +486,39 @@ fn place_jump(address: usize, jump_size: usize, relative_offset: usize) {
   }
 }
 
-fn get_ret_jump(src_address: usize, dst_address: usize, jump_size: usize, hook_type: HookType, instruction_info: InstructionInfo, bytes_len: usize) -> usize {
+fn get_required_nops(instr_info: InstructionsInfo, jump_size: usize) -> usize {
+  let mut length = 0;
+  for instr in instr_info.instrs {
+    length += instr.len();
+    if length >= jump_size {
+      break;
+    }
+  }
+
+  length.abs_diff(jump_size)
+}
+
+fn get_ret_jump(src_address: usize, dst_address: usize, jump_size: usize, hook_type: HookType, instr_info: InstructionsInfo, bytes_len: usize) -> usize {
+  let required_nops = get_required_nops(instr_info.clone(), jump_size);
   let rva_dst;
   let mut rva_ret_jmp = src_address;
+
   if jump_size == 5 {
     if src_address < (dst_address as usize) {
       rva_dst = dst_address as usize - src_address - jump_size;
-      rva_ret_jmp = rva_dst + instruction_info.bytes.len() + jump_size + instruction_info.nops + 1;
+      rva_ret_jmp = rva_dst + instr_info.bytes.len() + jump_size + required_nops + 1;
       if hook_type == HookType::AllocNoOrg {
-        rva_ret_jmp = rva_dst + jump_size + instruction_info.nops + 1;
+        rva_ret_jmp = rva_dst + jump_size + required_nops + 1;
       }
     } else {
       rva_dst = src_address - dst_address as usize + jump_size - 1;
-      rva_ret_jmp = rva_dst - bytes_len - instruction_info.bytes.len() - jump_size + instruction_info.nops + 1;
+      rva_ret_jmp = rva_dst - bytes_len - instr_info.bytes.len() - jump_size + required_nops + 1;
       if hook_type == HookType::AllocNoOrg {
-        rva_ret_jmp = rva_dst - bytes_len - jump_size + instruction_info.nops + 1;
+        rva_ret_jmp = rva_dst - bytes_len - jump_size + required_nops + 1;
       }
     }
   } else if jump_size == 14 {
-    rva_ret_jmp = src_address + jump_size + instruction_info.nops;
+    rva_ret_jmp = src_address + jump_size + required_nops;
   }
   rva_ret_jmp
 }
@@ -516,22 +532,28 @@ fn get_jump_size(src_address: usize, dst_address: usize) -> usize {
   }
 }
 
+// fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
+//   let jump_size = get_jump_size(src_address, dst_address);
+
+//   if jump_size == 14 {
+//     return dst_address as isize;
+//   }
+
+//   let offset = if (src_address as isize) < (dst_address as isize) { src_address as isize - dst_address as isize } else { dst_address as isize - src_address as isize - jump_size as isize };
+
+//   offset as isize
+// }
+
 fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
   let jump_size = get_jump_size(src_address, dst_address);
+  let src_address = src_address as isize;
+  let dst_address = dst_address as isize;
 
   if jump_size == 14 {
-    return dst_address as isize;
+    return dst_address; // likely an absolute jump using `jmp [rip+0]` or similar
   }
 
-  let offset = if (src_address as isize) < (dst_address as isize) {
-    println!("Jumping backward: {:#x}", src_address - dst_address);
-    src_address as isize - dst_address as isize
-  } else {
-    println!("Jumping forward: {:#x}", dst_address - src_address);
-    dst_address as isize - src_address as isize - jump_size as isize
-  };
-
-  offset as isize
+  dst_address - (src_address + jump_size as isize)
 }
 
 static ARCHITECTURE: OnceLock<u32> = OnceLock::new();
@@ -561,29 +583,32 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: OwnedMem, hook
 
   unprotect(src_address);
 
-  let instruction_info = instruction_info(src_address, architecture, bytes.clone());
+  let ori_instr_info = instruction_info(src_address, jump_size, architecture);
+  let required_nops = get_required_nops(ori_instr_info.clone(), jump_size);
 
-  let mut ret_address_jump = dst_address as usize + bytes.len() + instruction_info.bytes.len();
+  // println!("ori_instr_info = {:X?}", ori_instr_info);
+
+  let mut ret_address_jump = dst_address as usize + bytes.len() + ori_instr_info.bytes.len();
 
   if hook_type == HookType::AllocNoOrg {
     ret_address_jump = dst_address as usize + bytes.len();
   }
 
   if dst_address != 0 {
-    let rva_ret_jmp = get_ret_jump(src_address, dst_address, jump_size, hook_type.clone(), instruction_info.clone(), bytes.len());
+    let rva_ret_jmp = get_ret_jump(src_address, dst_address, jump_size, hook_type.clone(), ori_instr_info.clone(), bytes.len());
 
     // placing the hook jump
     place_jump(src_address, jump_size, rva_mem as usize);
 
     // placing nops if needed at the hooked address
-    place_nops(src_address, instruction_info.nops, jump_size);
+    place_nops(src_address, required_nops, jump_size);
 
     // placing the injected bytes
     place_bytes(dst_address, bytes.clone());
 
     if hook_type == HookType::AllocWithOrg {
-      place_bytes(dst_address + bytes.len(), instruction_info.bytes.clone());
-      owned_mem.inc_used(instruction_info.bytes.len()).unwrap();
+      place_bytes(dst_address + bytes.len(), ori_instr_info.bytes.clone());
+      owned_mem.inc_used(ori_instr_info.bytes.len()).unwrap();
     }
 
     // placing the return jump
@@ -592,7 +617,7 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: OwnedMem, hook
     owned_mem.inc_used(bytes.len()).unwrap();
     owned_mem.inc_used(jump_size).unwrap();
 
-    println!("OwnedMem = {:#X?}", owned_mem);
+    // println!("OwnedMem = {:#X?}", owned_mem);
   }
 
   owned_mem
