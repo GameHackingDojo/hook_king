@@ -1,0 +1,25 @@
+[package]
+name = "hook_king"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced-x86 = { version = "1.21.0", features = ["code_asm"] }
+paste = "1.0.15"
+winapi = { version = "0.3.9", features = [
+  "consoleapi",
+  "wincon",
+  "processthreadsapi",
+  "libloaderapi",
+  "memoryapi",
+  "wow64apiset",
+] }
+parking_lot = "0.12.4"
+
+[dev-dependencies]
+
+
+[[test]]
+name = "test_exe"
+path = "tests/test_exe.rs"
+harness = false            # This allows you to write a proper main()

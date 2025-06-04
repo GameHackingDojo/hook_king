@@ -1,0 +1,8 @@
+tab_spaces = 2
+fn_params_layout = "Compressed"
+max_width = 500
+fn_call_width = 500
+doc_comment_code_block_width = 500
+imports_indent = "Visual"
+imports_layout = "Horizontal"
+fn_single_line = true
