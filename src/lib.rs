@@ -221,7 +221,7 @@ pub enum HookType {
 /// ```
 
 // pub unsafe fn asm_hook(name: &str, address: usize, hook_type: HookType, owned_mems: Option<Arc<Mutex<Vec<OwnedMem>>>>, assembly: impl Fn(&mut CodeAssembler)) {
-pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<OwnedMem>>>>) {
+pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<OwnedMem>>>>) -> Result<(), Box<dyn std::error::Error>> {
   let name = hook_info.name.clone();
   let address = hook_info.address;
   let hook_type = hook_info.typ;
@@ -277,46 +277,47 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
     for index in 0..bytes.len() {
       (*original_bytes)[index] = bytes[index];
     }
-    return;
+    return Ok(());
   }
 
-  if owned_mems.is_some() {
-    let vec_mem = owned_mems.clone().unwrap().read().clone();
-    let required_size = estimate_required_size(address, architecture, &assembly);
-    let mem_index = if owned_mems.is_some() { OwnedMem::check_in_vec(address, required_size, vec_mem.clone()) } else { None };
+  if let Some(owned_mems) = owned_mems {
+    let vec_mem = owned_mems.clone().read().clone();
+    let required_size = estimate_required_size(address, architecture, &assembly)?;
+    let mem_index = OwnedMem::check_in_vec(address, required_size, vec_mem.clone());
 
     // println!("{:X?}", owned_mems.clone().unwrap().read());
 
-    if mem_index.is_some() {
-      let mem = vec_mem[mem_index.unwrap()].clone();
-      let bytes = assemble(address, architecture, assembly);
+    if let Some(mem_index) = mem_index {
+      let mem = vec_mem[mem_index].clone();
+      let bytes = assemble(address, architecture, assembly)?;
       let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
       owned_mem.hooks.push(hook_info.clone());
-      owned_mems.clone().unwrap().write()[mem_index.unwrap()] = owned_mem.clone();
+      owned_mems.clone().write()[mem_index] = owned_mem.clone();
       // println!("{:X?}", owned_mems.clone().unwrap().read());
       println!("Appended {:X?}", owned_mem);
     } else {
-      let mem = alloc(module_base).unwrap();
-      let bytes = assemble(mem.address, architecture, assembly);
+      let mem = alloc(module_base)?;
+      let bytes = assemble(mem.address, architecture, assembly)?;
       let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
       owned_mem.hooks.push(hook_info.clone());
-      owned_mems.unwrap().write().push(owned_mem.clone());
+      owned_mems.write().push(owned_mem.clone());
       // println!("{:X?}", owned_mems.clone().unwrap().read());
       println!("Allocated {:X?}", owned_mem);
     }
   } else {
-    let mem = alloc(module_base).unwrap();
-    let bytes = assemble(mem.address, architecture, assembly);
+    let mem = alloc(module_base)?;
+    let bytes = assemble(mem.address, architecture, assembly)?;
     insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
     // println!("No owned memory provided {:X?}", owned_mem);
   }
+  Ok(())
 }
 
 fn process() -> HANDLE { unsafe { GetCurrentProcess() } }
 
-fn alloc(address: usize) -> Result<OwnedMem, String> {
+fn alloc(address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
   let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
   let mut current_address = address;
   let mut attempts = 0;
@@ -379,9 +380,9 @@ fn module_base(module: Option<&str>) -> usize {
   handle as usize
 }
 
-fn estimate_required_size(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> usize {
-  let bytes = assemble(address, architecture, assembly).len();
-  bytes * 2
+fn estimate_required_size(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> Result<usize, Box<dyn std::error::Error>> {
+  let bytes = assemble(address, architecture, assembly)?.len();
+  Ok(bytes * 2)
 }
 
 fn unprotect(address: usize) {
@@ -391,7 +392,7 @@ fn unprotect(address: usize) {
   unsafe { VirtualProtect(address as _, protection_size, PAGE_EXECUTE_READWRITE, old_protection) };
 }
 
-fn assemble(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
+fn assemble(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
   let mut assembler = CodeAssembler::new(architecture).expect("Failed at constructing CodeAssembler");
   assembly(&mut assembler);
   // let assembled_bytes = assembler.assemble(address as u64).expect("Failed at assembling CodeAssembler");
@@ -401,7 +402,7 @@ fn assemble(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssemb
   let block = InstructionBlock::new(instructions, address as u64);
 
   let result = BlockEncoder::encode(architecture, block, BlockEncoderOptions::DONT_FIX_BRANCHES).expect("Failed at encoding");
-  result.code_buffer
+  Ok(result.code_buffer)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -536,11 +537,11 @@ static ARCHITECTURE: OnceLock<u32> = OnceLock::new();
 
 fn arch() -> u32 { *ARCHITECTURE.get_or_init(|| get_architecture(process()).unwrap_or(64)) }
 
-fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, String> {
+fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn std::error::Error>> {
   let mut is_wow64 = 0;
   let result = unsafe { IsWow64Process(handle, &mut is_wow64) };
   if result == 0 {
-    return Err("Couldn't get the architecture".to_string());
+    return Err("Couldn't get the architecture".into());
   }
   Ok(if is_wow64 == 0 { 64 } else { 32 })
 }
@@ -596,11 +597,11 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: OwnedMem, hook
   owned_mem
 }
 
-fn get_region_size(address: usize) -> Result<usize, String> {
+fn get_region_size(address: usize) -> Result<usize, Box<dyn std::error::Error>> {
   let mut mem_info = unsafe { zeroed() };
   let result = unsafe { VirtualQuery(address as *mut _, &mut mem_info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
 
-  if result > 0 { Ok(mem_info.RegionSize) } else { Err("Failed to retrieve region size".to_string()) }
+  if result > 0 { Ok(mem_info.RegionSize) } else { Err("Failed to retrieve region size".into()) }
 }
 
 // #[test]
@@ -641,7 +642,7 @@ fn test() {
     typ: HookType::AllocWithOrg,
     assembly: asm,
   };
-  unsafe { asm_hook(hook_info, None) }
+  unsafe { asm_hook(hook_info, None).unwrap() }
 }
 
 // #[test]
