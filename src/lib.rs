@@ -1,6 +1,6 @@
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 use parking_lot::RwLock;
-use std::{ffi::CString, mem::zeroed, ptr::{null, null_mut}, sync::{Arc, OnceLock}, thread::sleep, time::Duration, usize};
+use std::{ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
 #[macro_export]
@@ -75,12 +75,12 @@ pub struct OwnedMem {
 
 impl OwnedMem {
   /// increase the used memory propery
-  pub fn inc_used(&mut self, size: usize) -> Result<(), String> {
+  pub fn inc_used(&mut self, size: usize) -> Result<(), Box<dyn std::error::Error>> {
     if self.used + size < self.size {
       self.used += size;
       Ok(())
     } else {
-      Err("The used size has exceeded the available size".to_string())
+      Err("The used size has exceeded the available size".into())
     }
   }
 
@@ -525,24 +525,8 @@ fn get_ret_jump(src_address: usize, dst_address: usize, jump_size: usize, hook_t
 
 fn get_jump_size(src_address: usize, dst_address: usize) -> usize {
   let distance = dst_address.abs_diff(src_address);
-  if distance > i32::MAX as usize {
-    14 // long jump
-  } else {
-    5 // near jump
-  }
+  if distance > i32::MAX as usize { 14 } else { 5 }
 }
-
-// fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
-//   let jump_size = get_jump_size(src_address, dst_address);
-
-//   if jump_size == 14 {
-//     return dst_address as isize;
-//   }
-
-//   let offset = if (src_address as isize) < (dst_address as isize) { src_address as isize - dst_address as isize } else { dst_address as isize - src_address as isize - jump_size as isize };
-
-//   offset as isize
-// }
 
 fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
   let jump_size = get_jump_size(src_address, dst_address);
@@ -550,7 +534,7 @@ fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
   let dst_address = dst_address as isize;
 
   if jump_size == 14 {
-    return dst_address; // likely an absolute jump using `jmp [rip+0]` or similar
+    return dst_address;
   }
 
   dst_address - (src_address + jump_size as isize)
@@ -583,6 +567,7 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: OwnedMem, hook
 
   unprotect(src_address);
 
+  // getting the instructions length covered by the jump
   let ori_instr_info = instruction_info(src_address, jump_size, architecture);
   let required_nops = get_required_nops(ori_instr_info.clone(), jump_size);
 
@@ -629,120 +614,3 @@ fn get_region_size(address: usize) -> Result<usize, Box<dyn std::error::Error>> 
 
   if result > 0 { Ok(mem_info.RegionSize) } else { Err("Failed to retrieve region size".into()) }
 }
-
-// #[test]
-// fn test() {
-//   let module_base: usize = 0x40000000;
-
-//   let asm = Box::new(move |a: &mut CodeAssembler| {
-//     assemble_1!(a,
-//       push rax;
-//       push rbx;
-//       pop rcx;
-//     );
-//   });
-
-//   let hook_info = HookInfo {
-//     name: "The name".to_string(),
-//     address: module_base + 0x428A43,
-//     typ: HookType::AllocWithOrg,
-//     assembly: asm,
-//   };
-//   unsafe { asm_hook(hook_info, None) }
-// }
-
-#[test]
-fn test() {
-  let module_base: usize = 0x40000000;
-
-  let asm = assemble!(
-    push rax;
-    push rbx;
-    pop rcx;
-    nop, 3;
-  );
-
-  let hook_info = HookInfo {
-    name: "The name".to_string(),
-    address: module_base + 0x428A43,
-    typ: HookType::AllocWithOrg,
-    assembly: asm,
-  };
-  unsafe { asm_hook(hook_info, None).unwrap() }
-}
-
-// #[test]
-// fn test() {
-//   let module_base: usize = 0x40000000;
-//   unsafe {
-//     asm_hook(
-//       "infinite_money",
-//       module_base + 0x428A43,
-//       HookType::AllocWithOrg,
-//       assemble!(
-
-//         push rax;
-//         push rbx;
-//         push rcx;
-//         label2|label3|
-//         push rdx;
-//         push rsi;
-//         push rdi;
-//         push rbp;
-//         push rsp;
-//         push r8;
-//         push r9;
-//         push r11;
-//         push r12;
-//         push r13;
-//         push r14;
-//         push r15;
-//         mov rax,rcx;
-//         mov byte ptr [rax+50],2;
-//         mov word ptr [rax+50*4],2;
-//         mov dword ptr [rax+rax*8+50],2;
-//         mov qword ptr [rax],2;
-//         jmp label2;
-//         label:
-//         mov rsp,rsi;
-//         mov r12d,4;
-//         mov r12w,4;
-//         mov r12b,4;
-//         mov r12b,4;
-//         jmp label;
-//         movups xmm1,xmm0;
-//         sub rsp,100;
-//         call rax;
-//         call module_base as u64;
-//         xor al,bl;
-//         xorps xmm0,xmm10;
-//         add rsp,100;
-//         pop r15;
-//         pop r14;
-//         pop r13;
-//         pop r12;
-//         pop r11;
-//         pop r10;
-//         pop r9;
-//         pop r8;
-//         pop rsp;
-//         pop rbp;
-//         pop rdi;
-//         pop rsi;
-//         pop rdx;
-//         pop rcx;
-//         pop rbx;
-//         pop rax;
-//         call module_base as u64 + 0x428C16;
-//         jmp module_base as u64 + 0x428AAC;
-//         ret;
-//         ret;
-//         ret_1 1;
-//         mpsadbw xmm0, xmm1, 2;
-//         vsqrtps ymm10, dword ptr [rcx];
-//         label_return:
-//         ret;
-//       ),
-//     );
-//   }
-// }

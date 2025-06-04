@@ -2,6 +2,11 @@
 name = "hook_king"
 version = "0.1.0"
 edition = "2024"
+authors = ["Ken Masters <GameHackingDojo@gmail.com>"]
+description = "Automated efficient Assembly hooking library that works internally and externally for both x86/x64"
+license = "GPL-3.0"
+repository = "https://github.com/GameHackingDojo/hook_king"
+license-file = "LICENSE"
 
 [dependencies]
 iced-x86 = { version = "1.21.0", features = ["code_asm"] }

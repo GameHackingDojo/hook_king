@@ -9,5 +9,5 @@ fn main() {
     typ: HookType::AllocWithOrg,
     assembly: assemble!(push rax;),
   };
-  unsafe { asm_hook(hook_info, None) };
+  unsafe { asm_hook(hook_info, None).unwrap() };
 }
