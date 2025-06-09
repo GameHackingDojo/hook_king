@@ -161,20 +161,6 @@ pub enum HookType {
 ///  HookType::AllocWithOrg,
 ///  assemble!(
 ///    push rax;
-///    push rbx;
-///    push rcx;
-///    push rdx;
-///    push rsi;
-///    push rdi;
-///    push rbp;
-///    push rsp;
-///    push r8;
-///    push r9;
-///    push r11;
-///    push r12;
-///    push r13;
-///    push r14;
-///    push r15;
 ///    mov rax,rcx;
 ///    mov byte ptr [rax+50],2;
 ///    mov word ptr [rax+50*4],2;
@@ -194,21 +180,6 @@ pub enum HookType {
 ///    xor al,bl;
 ///    xorps xmm0,xmm10;
 ///    add rsp,100;
-///    pop r15;
-///    pop r14;
-///    pop r13;
-///    pop r12;
-///    pop r11;
-///    pop r10;
-///    pop r9;
-///    pop r8;
-///    pop rsp;
-///    pop rbp;
-///    pop rdi;
-///    pop rsi;
-///    pop rdx;
-///    pop rcx;
-///    pop rbx;
 ///    pop rax;
 ///    call module_base as u64 + 0x428C16;
 ///    jmp module_base as u64 + 0x428AAC;
