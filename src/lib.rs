@@ -1,7 +1,7 @@
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 use parking_lot::RwLock;
-use std::{ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
-use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
+use std::{collections::HashMap, ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
+use winapi::{ctypes::c_void, shared::ntstatus::STATUS_RETRY, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
 #[macro_export]
 macro_rules! assemble_1 {
@@ -65,9 +65,32 @@ const SAFETY: usize = 0x10;
 struct MyTraitOptions;
 impl SpecializedFormatterTraitOptions for MyTraitOptions {}
 
+#[derive(Clone)]
+pub struct HookInfo {
+  pub name: String,
+  pub address: usize,
+  pub typ: HookType,
+  pub assembly: Arc<dyn Fn(&mut CodeAssembler) + Send + Sync + 'static>,
+}
+
+impl std::fmt::Debug for HookInfo {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("HookInfo").field("name", &self.name).field("address", &format!("{:016X?}", &self.address)).field("typ", &self.typ).field("assembly", &opcode_display(arch(), self.assembly.as_ref())).finish() }
+}
+
+impl Default for HookInfo {
+  fn default() -> Self {
+    Self {
+      name: String::new(),
+      address: 0,
+      typ: HookType::default(),
+      assembly: Arc::new(|_: &mut CodeAssembler| {}),
+    }
+  }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct OwnedMem {
-  pub hooks: Vec<HookInfo>,
+  // pub hooks: Vec<HookInfo>,
   pub address: usize,
   pub size: usize,
   pub used: usize,
@@ -96,36 +119,13 @@ impl OwnedMem {
     required_size <= available
   }
 
-  pub fn check_in_vec(address: usize, required_size: usize, owned_mems: Vec<OwnedMem>) -> Option<usize> {
-    for (index, item) in owned_mems.iter().enumerate() {
-      if item.is_nearby(address) && item.is_mem_enough(required_size) {
+  pub fn check_in_vec(address: usize, required_size: usize, owned_mems: Arc<RwLock<Vec<Arc<RwLock<OwnedMem>>>>>) -> Option<usize> {
+    for (index, item) in owned_mems.read().iter().enumerate() {
+      if item.read().is_nearby(address) && item.read().is_mem_enough(required_size) {
         return Some(index);
       }
     }
     return None;
-  }
-}
-
-#[derive(Clone)]
-pub struct HookInfo {
-  pub name: String,
-  pub address: usize,
-  pub typ: HookType,
-  pub assembly: Arc<dyn Fn(&mut CodeAssembler) + Send + Sync + 'static>,
-}
-
-impl std::fmt::Debug for HookInfo {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("HookInfo").field("name", &self.name).field("address", &format!("{:016X?}", &self.address)).field("typ", &self.typ).field("assembly", &opcode_display(arch(), self.assembly.as_ref())).finish() }
-}
-
-impl Default for HookInfo {
-  fn default() -> Self {
-    Self {
-      name: String::new(),
-      address: 0,
-      typ: HookType::default(),
-      assembly: Arc::new(|_: &mut CodeAssembler| {}),
-    }
   }
 }
 
@@ -146,97 +146,153 @@ pub enum HookType {
   AllocWithOrg,
 }
 
-/// # Warning
-///
-/// Not giving a name or providing an invalid address will result in panicing
-///
-/// Give the hook a proper name. Name must be no less than 5 characters!
-///
-/// # Example
-/// ```
-///let module_base: usize = 0x40000000;
-///asm_hook(
-/// "infinite_money",
-///  module_base + 0x428A43,
-///  HookType::AllocWithOrg,
-///  assemble!(
-///    push rax;
-///    mov rax,rcx;
-///    mov byte ptr [rax+50],2;
-///    mov word ptr [rax+50*4],2;
-///    mov dword ptr [rax+rax*8+50],2;
-///    mov qword ptr [rax],2;
-///    label:
-///    mov rsp,rsi;
-///    mov r12d,4;
-///    mov r12w,4;
-///    mov r12b,4;
-///    mov r12b,4;
-///    jmp label;
-///    movups xmm1,xmm0;
-///    sub rsp,100;
-///    call rax;
-///    call module_base as u64;
-///    xor al,bl;
-///    xorps xmm0,xmm10;
-///    add rsp,100;
-///    pop rax;
-///    call module_base as u64 + 0x428C16;
-///    jmp module_base as u64 + 0x428AAC;
-///    ret;
-///    ret;
-///    ret_1 1;
-///    mpsadbw xmm0, xmm1, 2;
-///    vsqrtps ymm10, dword ptr [rcx];
-///    label_return:
-///    ret;
-///  ),
-///);
-/// ```
+#[derive(Clone, Debug)]
+pub struct HookKing {
+  process: Arc<RwLock<*mut std::ffi::c_void>>,
 
-// #[cfg(feature = "parking-lot")]
-// #[cfg(feature = "std-lock")]
-pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<OwnedMem>>>>) -> Result<(), Box<dyn std::error::Error>> {
-  let name = hook_info.name.clone();
-  let address = hook_info.address;
-  let hook_type = hook_info.typ;
-  let assembly = hook_info.assembly.as_ref();
-  let architecture = arch();
-  let module_base = module_base(None);
+  owned_mems: Arc<RwLock<Vec<Arc<RwLock<OwnedMem>>>>>,
+  owned_mems_address: Arc<RwLock<HashMap<usize, Arc<RwLock<OwnedMem>>>>>,
 
-  if name.len() < 5 {
-    panic!("Give the hook a proper name. Name must be no less than 5 characters!")
+  hooks: Arc<RwLock<Vec<Arc<RwLock<HookInfo>>>>>,
+  hooks_name: Arc<RwLock<HashMap<String, Arc<RwLock<HookInfo>>>>>,
+  hooks_index: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
+  hooks_address: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
+}
+
+impl Default for HookKing {
+  fn default() -> Self {
+    return Self {
+      process: Arc::new(RwLock::new(std::ptr::null_mut())),
+      owned_mems: Arc::new(RwLock::new(Vec::new())),
+      owned_mems_address: Arc::new(RwLock::new(HashMap::new())),
+      hooks: Arc::new(RwLock::new(Vec::new())),
+      hooks_name: Arc::new(RwLock::new(HashMap::new())),
+      hooks_index: Arc::new(RwLock::new(HashMap::new())),
+      hooks_address: Arc::new(RwLock::new(HashMap::new())),
+    };
+  }
+}
+
+impl HookKing {
+  pub fn new(process: *mut std::ffi::c_void) -> Self { Self { process: Arc::new(RwLock::new(process)), ..Default::default() } }
+
+  pub fn change_process(&mut self, process: Option<*mut std::ffi::c_void>) { if process.is_some() { self.process = Arc::new(RwLock::new(process.unwrap())) } else { self.process = Arc::new(RwLock::new(unsafe { GetCurrentProcess() as _ })) } }
+
+  pub fn get_hook_by_name(&self, name: &str) -> Option<Arc<RwLock<HookInfo>>> { self.hooks_name.read().get(name).cloned() }
+
+  pub fn get_hook_by_index(&self, index: usize) -> Option<Arc<RwLock<HookInfo>>> { self.hooks_index.read().get(&index).cloned() }
+
+  pub fn get_hook_by_address(&self, address: usize) -> Option<Arc<RwLock<HookInfo>>> { self.hooks_address.read().get(&address).cloned() }
+
+  pub fn get_owned_mem_by_address(&self, address: usize) -> Option<Arc<RwLock<OwnedMem>>> { self.owned_mems_address.read().get(&address).cloned() }
+
+  pub fn add_hook(&mut self, hook: HookInfo) {
+    let arw = Arc::new(RwLock::new(hook));
+    let index = self.hooks.read().len(); // current position will be the index
+
+    self.hooks.write().push(arw.clone());
+    self.hooks_name.write().insert(arw.read().name.clone(), arw.clone());
+    self.hooks_index.write().insert(index, arw.clone());
+    self.hooks_address.write().insert(arw.clone().read().address, arw);
   }
 
-  let mut mbi = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-  if unsafe { VirtualQuery(address as *const _, &mut mbi as *mut _, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || mbi.State == 0 {
-    panic!("Not a valid address! {address:#X}");
+  pub fn add_owned_mem(&mut self, owned_mem: OwnedMem) {
+    let arw = Arc::new(RwLock::new(owned_mem));
+
+    self.owned_mems.write().push(arw.clone());
+    self.owned_mems_address.write().insert(arw.clone().read().address, arw);
   }
 
-  if hook_type == HookType::NoAlloc {
-    unprotect(address);
+  /// # Warning
+  ///
+  /// Not giving a name or providing an invalid address will result in panicing
+  ///
+  /// Give the hook a proper name. Name must be no less than 5 characters!
+  ///
+  /// # Example
+  /// ```
+  ///let module_base: usize = 0x40000000;
+  ///asm_hook(
+  /// "infinite_money",
+  ///  module_base + 0x428A43,
+  ///  HookType::AllocWithOrg,
+  ///  assemble!(
+  ///    push rax;
+  ///    mov rax,rcx;
+  ///    mov byte ptr [rax+50],2;
+  ///    mov word ptr [rax+50*4],2;
+  ///    mov dword ptr [rax+rax*8+50],2;
+  ///    mov qword ptr [rax],2;
+  ///    label:
+  ///    mov rsp,rsi;
+  ///    mov r12d,4;
+  ///    mov r12w,4;
+  ///    mov r12b,4;
+  ///    mov r12b,4;
+  ///    jmp label;
+  ///    movups xmm1,xmm0;
+  ///    sub rsp,100;
+  ///    call rax;
+  ///    call module_base as u64;
+  ///    xor al,bl;
+  ///    xorps xmm0,xmm10;
+  ///    add rsp,100;
+  ///    pop rax;
+  ///    call module_base as u64 + 0x428C16;
+  ///    jmp module_base as u64 + 0x428AAC;
+  ///    ret;
+  ///    ret;
+  ///    ret_1 1;
+  ///    mpsadbw xmm0, xmm1, 2;
+  ///    vsqrtps ymm10, dword ptr [rcx];
+  ///    label_return:
+  ///    ret;
+  ///  ),
+  ///);
+  /// ```
 
-    let bytes = assemble(address, architecture, assembly).unwrap();
-    let instr_info = instruction_info(address, bytes.len(), architecture);
-    let required_nops = get_required_nops(instr_info.clone(), 0);
+  // #[cfg(feature = "parking-lot")]
+  // #[cfg(feature = "std-lock")]
+  // pub unsafe fn asm_hook(&self, hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<OwnedMem>>>>) -> Result<(), Box<dyn std::error::Error>> {
+  pub unsafe fn asm_hook(&mut self, hook_info: HookInfo) -> Result<(), Box<dyn std::error::Error>> {
+    let name = hook_info.name.clone();
+    let address = hook_info.address;
+    let hook_type = hook_info.typ;
+    let assembly = hook_info.assembly.as_ref();
+    let architecture = arch();
+    let module_base = module_base(None);
 
-    place_nops(address, required_nops - bytes.len(), bytes.len());
-    place_bytes(address, bytes);
+    if name.len() < 5 {
+      panic!("Give the hook a proper name. Name must be no less than 5 characters!")
+    }
 
-    return Ok(());
-  }
+    let mut mbi = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+    if unsafe { VirtualQuery(address as *const _, &mut mbi as *mut _, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || mbi.State == 0 {
+      panic!("Not a valid address! {address:#X}");
+    }
 
-  if let Some(owned_mems) = owned_mems {
-    let vec_mem = owned_mems.clone().read().clone();
+    if hook_type == HookType::NoAlloc {
+      unprotect(address);
+
+      let bytes = assemble(address, architecture, assembly).unwrap();
+      let instr_info = instruction_info(address, bytes.len(), architecture);
+      let required_nops = get_required_nops(instr_info.clone(), 0);
+
+      place_nops(address, required_nops - bytes.len(), bytes.len());
+      place_bytes(address, bytes);
+
+      return Ok(());
+    }
+
     let required_size = estimate_required_size(address, architecture, &assembly)?;
-    let mem_index = OwnedMem::check_in_vec(address, required_size, vec_mem.clone());
+    let mem_index = OwnedMem::check_in_vec(address, required_size, self.owned_mems.clone());
 
     // println!("{:X?}", owned_mems.clone().unwrap().read());
 
     if let Some(mem_index) = mem_index {
-      let mem = vec_mem[mem_index].clone();
+      let mem = self.owned_mems.read()[mem_index].clone();
       let bytes = assemble(address, architecture, assembly)?;
-      let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
+      insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
 
       // println!("hook_info {:X?}", hook_info);
       owned_mem.hooks.push(hook_info.clone());
@@ -254,14 +310,9 @@ pub unsafe fn asm_hook(hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<Ow
       // println!("{:X?}", owned_mems.clone().unwrap().read());
       // println!("Allocated {:X?}", owned_mem);
     }
-  } else {
-    let mem = alloc(module_base)?;
-    let bytes = assemble(mem.address, architecture, assembly)?;
-    insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
-    // println!("hook_info {:X?}", hook_info);
-    // println!("No owned memory provided {:X?}", owned_mem);
+
+    Ok(())
   }
-  Ok(())
 }
 
 fn process() -> HANDLE { unsafe { GetCurrentProcess() } }
@@ -527,9 +578,8 @@ fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn st
 /// ins_ddress: the address to insert the bytes at
 ///
 /// hook_address: the hooked address
-fn insert_bytes(src_address: usize, architecture: u32, owned_mem: OwnedMem, hook_type: HookType, bytes: Vec<u8>) -> OwnedMem {
-  let mut owned_mem = owned_mem;
-  let dst_address = owned_mem.address + owned_mem.used;
+fn insert_bytes(src_address: usize, architecture: u32, owned_mem: Arc<RwLock<OwnedMem>>, hook_type: HookType, bytes: Vec<u8>) {
+  let dst_address = owned_mem.read().address + owned_mem.read().used;
 
   let jump_size = get_jump_size(dst_address, src_address);
 
@@ -564,19 +614,17 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: OwnedMem, hook
 
     if hook_type == HookType::AllocWithOrg {
       place_bytes(dst_address + bytes.len(), ori_instr_info.bytes.clone());
-      owned_mem.inc_used(ori_instr_info.bytes.len()).unwrap();
+      owned_mem.write().inc_used(ori_instr_info.bytes.len()).unwrap();
     }
 
     // placing the return jump
     place_jump(ret_address_jump, jump_size, rva_ret_jmp);
 
-    owned_mem.inc_used(bytes.len()).unwrap();
-    owned_mem.inc_used(jump_size).unwrap();
+    owned_mem.write().inc_used(bytes.len()).unwrap();
+    owned_mem.write().inc_used(jump_size).unwrap();
 
     // println!("OwnedMem = {:#X?}", owned_mem);
   }
-
-  owned_mem
 }
 
 fn get_region_size(address: usize) -> Result<usize, Box<dyn std::error::Error>> {
