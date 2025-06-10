@@ -117,7 +117,7 @@ impl HookInfo {
   }
 
   pub fn disable(&mut self) {
-    println!("Address = {:#X?}, {:#X?}", self.address, self.org_bytes);
+    // println!("Address = {:#X?}, {:#X?}", self.address, self.org_bytes);
     place_bytes(self.address, self.org_bytes.clone());
 
     self.enabled = false;
@@ -428,8 +428,8 @@ impl HookKing {
     let bytes = assemble(address, architecture, assembly)?;
     insert_bytes(address, architecture, &mut mem, &mut hook_info, bytes.clone())?;
 
-    println!("org_instr_info.bytes = {:#X?}", hook_info.org_bytes);
-    println!("hook_info.jumping_address = {:#X}", hook_info.jumping_address);
+    // println!("org_instr_info.bytes = {:#X?}", hook_info.org_bytes);
+    // println!("hook_info.jumping_address = {:#X}", hook_info.jumping_address);
 
     if let Some(index) = mem_index {
       self.update_owned_mem(mem.clone(), index)?;
