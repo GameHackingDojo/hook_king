@@ -7,7 +7,7 @@ fn main() {
   let hook_info = HookInfo {
     name: "my name".to_string(),
     address: module_handle + 0x12321,
-    typ: HookType::AllocWithOrg,
+    typ: HookType::Detour,
     assembly: assemble!(push rax;),
   };
 

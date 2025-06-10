@@ -157,33 +157,41 @@ impl Default for ProcessId {
 
 /// # Usage
 ///
-/// [`NoAlloc`]: Does not allocate memory, places the instructions at the address and manges noping extra bytes if needed.
+/// [`Patch`]: Does not allocate memory, places the instructions at the address and manges noping extra bytes if needed.
 ///
-/// [`AllocNoOrg`]: Allocates memeory near the address if possible, adds a jump to the allocated memory and places the instructions within the allocated memory without relocating the original instruction at the end of the added instructions.
+/// [`Detour`]: Allocates memeory near the address if possible, adds a jump to the allocated memory, places the instructions within the allocated memory and relocates the original instruction at the end of the added instructions.
 ///
-/// [`AllocWithOrg`]: Allocates memeory near the address if possible, adds a jump to the allocated memory, places the instructions within the allocated memory and relocates the original instruction at the end of the added instructions.
+/// [`DetourNoOrg`]: Allocates memeory near the address if possible, adds a jump to the allocated memory and places the instructions within the allocated memory without relocating the original instruction at the end of the added instructions.
 ///
+
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum HookLookup {
+  Name(String),
+  Address(usize),
+  Index(usize),
+}
+
+impl Default for HookLookup {
+  fn default() -> Self { HookLookup::Index(0) }
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum MemLookup {
+  Address(usize),
+  Index(usize),
+}
+
+impl Default for MemLookup {
+  fn default() -> Self { MemLookup::Index(0) }
+}
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
 pub enum HookType {
   #[default]
   Patch,
-  AllocNoOrg,
-  AllocWithOrg,
+  Detour,
+  DetourNoOrg,
 }
-
-// #[derive(Clone, Debug, Default)]
-// pub struct HookKing {
-//   process: Arc<RwLock<ProcessId>>,
-
-//   owned_mems: Arc<RwLock<Vec<Arc<RwLock<OwnedMem>>>>>,
-//   owned_mems_address: Arc<RwLock<HashMap<usize, Arc<RwLock<OwnedMem>>>>>,
-
-//   hooks: Arc<RwLock<Vec<Arc<RwLock<HookInfo>>>>>,
-//   hooks_name: Arc<RwLock<HashMap<String, Arc<RwLock<HookInfo>>>>>,
-//   hooks_index: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
-//   hooks_address: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
-// }
 
 #[derive(Clone, Debug, Default)]
 pub struct HookKing {
@@ -225,15 +233,30 @@ impl HookKing {
 
   pub fn change_process(&mut self, process: Option<ProcessId>) { if process.is_some() { self.process = Arc::new(RwLock::new(process.unwrap())) } else { self.process = Arc::new(RwLock::new(Self::current_process())) } }
 
-  pub fn get_hook_by_name(&self, name: &str) -> Option<HookInfo> { self.hooks_name.get(name).and_then(|idx| self.hooks.get(idx.value()).map(|h| h.clone())) }
+  pub fn get_hook(&self, lookup: HookLookup) -> Option<HookInfo> {
+    match lookup {
+      HookLookup::Name(name) => self.hooks_name.get_mut(&name).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())),
+      HookLookup::Address(address) => self.hooks_address.get_mut(&address).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())),
+      HookLookup::Index(index) => self.hooks.get_mut(&index).map(|h| h.clone()),
+    }
+  }
 
-  pub fn get_hook_by_address(&self, address: usize) -> Option<HookInfo> { self.hooks_address.get(&address).and_then(|idx| self.hooks.get(idx.value()).map(|h| h.clone())) }
+  pub fn get_mem(&self, lookup: MemLookup) -> Option<OwnedMem> {
+    match lookup {
+      MemLookup::Address(address) => self.owned_mems_address.get_mut(&address).and_then(|idx| self.owned_mems.get_mut(idx.value()).map(|h| h.clone())),
+      MemLookup::Index(index) => self.owned_mems.get_mut(&index).map(|h| h.clone()),
+    }
+  }
 
-  pub fn get_hook_by_index(&self, index: usize) -> Option<HookInfo> { self.hooks.get(&index).map(|h| h.clone()) }
+  // pub fn get_hook_by_name(&self, name: &str) -> Option<HookInfo> { self.hooks_name.get_mut(name).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())) }
 
-  pub fn get_mem_by_index(&self, index: usize) -> Option<OwnedMem> { self.owned_mems.get(&index).map(|h| h.clone()) }
+  // pub fn get_hook_by_address(&self, address: usize) -> Option<HookInfo> { self.hooks_address.get_mut(&address).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())) }
 
-  pub fn get_mem_by_address(&self, address: usize) -> Option<OwnedMem> { self.owned_mems_address.get(&address).and_then(|idx| self.owned_mems.get(idx.value()).map(|h| h.clone())) }
+  // pub fn get_hook_by_index(&self, index: usize) -> Option<HookInfo> { self.hooks.get_mut(&index).map(|h| h.clone()) }
+
+  // pub fn get_mem_by_index(&self, index: usize) -> Option<OwnedMem> { self.owned_mems.get_mut(&index).map(|h| h.clone()) }
+
+  // pub fn get_mem_by_address(&self, address: usize) -> Option<OwnedMem> { self.owned_mems_address.get_mut(&address).and_then(|idx| self.owned_mems.get_mut(idx.value()).map(|h| h.clone())) }
 
   fn add_hook(&mut self, hook: HookInfo) {
     self.hooks.insert(self.hooks.len(), hook.clone());
@@ -244,6 +267,35 @@ impl HookKing {
   fn add_owned_mem(&mut self, owned_mem: OwnedMem) {
     self.owned_mems.insert(self.owned_mems.len(), owned_mem.clone());
     self.owned_mems_address.insert(owned_mem.address, self.owned_mems.len());
+  }
+
+  fn update_hook(&mut self, hook: HookInfo, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if self.hooks.contains_key(&index) {
+      self.hooks.entry(index).and_modify(|hk| {
+        hk.name = hook.name;
+        hk.address = hook.address;
+        hk.typ = hook.typ;
+        hk.assembly = hook.assembly;
+      });
+
+      Ok(())
+    } else {
+      Err("Failed to update hook, incorrect index".into())
+    }
+  }
+
+  fn update_owned_mem(&mut self, owned_mem: OwnedMem, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if self.owned_mems.contains_key(&index) {
+      self.owned_mems.entry(index).and_modify(|mem| {
+        mem.address = owned_mem.address;
+        mem.size = owned_mem.size;
+        mem.used = owned_mem.used;
+      });
+
+      Ok(())
+    } else {
+      Err("Failed to update owned memory, incorrect index".into())
+    }
   }
 
   /// # Warning
@@ -317,7 +369,7 @@ impl HookKing {
     if hook_type == HookType::Patch {
       unprotect(address);
 
-      let bytes = assemble(address, architecture, assembly).unwrap();
+      let bytes = assemble(address, architecture, assembly)?;
       let instr_info = instruction_info(address, bytes.len(), architecture);
       let required_nops = get_required_nops(instr_info.clone(), 0);
 
@@ -330,16 +382,21 @@ impl HookKing {
     let required_size = estimate_required_size(address, architecture, &assembly)?;
     let mem_index = OwnedMem::check_in_mem(address, required_size, &self.owned_mems);
 
-    let mut mem = if let Some(mem_index) = mem_index { self.get_mem_by_index(mem_index).unwrap() } else { alloc(module_base)? };
+    let mut mem = if let Some(index) = mem_index { self.get_mem(MemLookup::Index(index)).unwrap() } else { alloc(module_base)? };
 
     let bytes = assemble(address, architecture, assembly)?;
     insert_bytes(address, architecture, &mut mem, hook_type, bytes);
 
-    self.add_owned_mem(mem.clone());
+    if let Some(index) = mem_index {
+      self.update_owned_mem(mem, index)?;
+    } else {
+      self.add_owned_mem(mem.clone());
+    }
+
     self.add_hook(hook_info.clone());
 
     println!("hook_info {:X?}", hook_info);
-    println!("Allocated {:X?}", mem);
+    println!("Allocated {:X?}", self.owned_mems);
 
     Ok(())
   }
@@ -386,12 +443,9 @@ fn alloc(address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
 
         if !alloc_mem.is_null() {
           // Success: populate owned_mem and break
-
           let size = get_region_size(alloc_mem as usize).unwrap();
-          // if owned_mems.is_some() {
           new_mem = OwnedMem { address: alloc_mem as usize, size, ..Default::default() };
-          //   owned_mems.unwrap().write().push(new_mem.clone());
-          // }
+
           break;
         }
       }
@@ -552,13 +606,13 @@ fn get_ret_jump(src_address: usize, dst_address: usize, jump_size: usize, hook_t
     if src_address < (dst_address as usize) {
       rva_dst = dst_address as usize - src_address - jump_size;
       rva_ret_jmp = rva_dst + instr_info.bytes.len() + jump_size + required_nops + 1;
-      if hook_type == HookType::AllocNoOrg {
+      if hook_type == HookType::DetourNoOrg {
         rva_ret_jmp = rva_dst + jump_size + required_nops + 1;
       }
     } else {
       rva_dst = src_address - dst_address as usize + jump_size - 1;
       rva_ret_jmp = rva_dst - bytes_len - instr_info.bytes.len() - jump_size + required_nops + 1;
-      if hook_type == HookType::AllocNoOrg {
+      if hook_type == HookType::DetourNoOrg {
         rva_ret_jmp = rva_dst - bytes_len - jump_size + required_nops + 1;
       }
     }
@@ -619,7 +673,7 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem,
 
   let mut ret_address_jump = dst_address as usize + bytes.len() + ori_instr_info.bytes.len();
 
-  if hook_type == HookType::AllocNoOrg {
+  if hook_type == HookType::DetourNoOrg {
     ret_address_jump = dst_address as usize + bytes.len();
   }
 
@@ -635,7 +689,7 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem,
     // placing the injected bytes
     place_bytes(dst_address, bytes.clone());
 
-    if hook_type == HookType::AllocWithOrg {
+    if hook_type == HookType::Detour {
       place_bytes(dst_address + bytes.len(), ori_instr_info.bytes.clone());
       owned_mem.inc_used(ori_instr_info.bytes.len()).unwrap();
     }
@@ -646,7 +700,7 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem,
     owned_mem.inc_used(bytes.len()).unwrap();
     owned_mem.inc_used(jump_size).unwrap();
 
-    // println!("OwnedMem = {:#X?}", owned_mem);
+    println!("OwnedMem = {:#X?}", owned_mem);
   }
 }
 
