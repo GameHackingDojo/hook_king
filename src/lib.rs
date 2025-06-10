@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 use parking_lot::RwLock;
-use std::{collections::HashMap, ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
+use std::{ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
 #[cfg(target_os = "windows")]
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
@@ -146,6 +146,9 @@ pub enum ProcessId {
   Windows(*mut std::ffi::c_void), // Process handle for Windows
   Linux(u32),                     // PID for Linux
 }
+
+unsafe impl Send for ProcessId {}
+unsafe impl Sync for ProcessId {}
 
 impl Default for ProcessId {
   #[cfg(target_os = "windows")]
@@ -395,8 +398,8 @@ impl HookKing {
 
     self.add_hook(hook_info.clone());
 
-    println!("hook_info {:X?}", hook_info);
-    println!("Allocated {:X?}", self.owned_mems);
+    // println!("hook_info {:X?}", hook_info);
+    // println!("Allocated {:X?}", self.owned_mems);
 
     Ok(())
   }
@@ -700,7 +703,7 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem,
     owned_mem.inc_used(bytes.len()).unwrap();
     owned_mem.inc_used(jump_size).unwrap();
 
-    println!("OwnedMem = {:#X?}", owned_mem);
+    // println!("OwnedMem = {:#X?}", owned_mem);
   }
 }
 
