@@ -2,6 +2,7 @@ use hook_king::*;
 use winapi::um::libloaderapi::GetModuleHandleA;
 
 fn main() {
+  let mut hook_king = HookKing::default();
   let module_handle = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
   let hook_info = HookInfo {
     name: "my name".to_string(),
@@ -9,5 +10,6 @@ fn main() {
     typ: HookType::AllocWithOrg,
     assembly: assemble!(push rax;),
   };
-  unsafe { asm_hook(hook_info, None).unwrap() };
+
+  unsafe { hook_king.asm_hook(hook_info).unwrap() };
 }

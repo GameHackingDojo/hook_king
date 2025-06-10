@@ -1,7 +1,9 @@
+use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 use parking_lot::RwLock;
 use std::{collections::HashMap, ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
-use winapi::{ctypes::c_void, shared::ntstatus::STATUS_RETRY, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
+#[cfg(target_os = "windows")]
+use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
 #[macro_export]
 macro_rules! assemble_1 {
@@ -119,14 +121,38 @@ impl OwnedMem {
     required_size <= available
   }
 
-  pub fn check_in_vec(address: usize, required_size: usize, owned_mems: Arc<RwLock<Vec<Arc<RwLock<OwnedMem>>>>>) -> Option<usize> {
-    for (index, item) in owned_mems.read().iter().enumerate() {
-      if item.read().is_nearby(address) && item.read().is_mem_enough(required_size) {
-        return Some(index);
+  pub fn check_in_mem(address: usize, required_size: usize, owned_mems: &DashMap<usize, OwnedMem>) -> Option<usize> {
+    // Iterate through all entries in the DashMap
+    for entry in owned_mems.iter() {
+      let (key, value) = entry.pair();
+      if value.is_nearby(address) && value.is_mem_enough(required_size) {
+        return Some(*key);
       }
     }
-    return None;
+    None
   }
+}
+
+#[derive(Clone, Debug, Default)]
+struct InstructionsInfo {
+  pub opcodes: Vec<String>,
+  pub instrs: Vec<Instruction>,
+  pub bytes: Vec<u8>,
+}
+
+/// Enum to hold the process identifier (either a handle or a PID).
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ProcessId {
+  Windows(*mut std::ffi::c_void), // Process handle for Windows
+  Linux(u32),                     // PID for Linux
+}
+
+impl Default for ProcessId {
+  #[cfg(target_os = "windows")]
+  fn default() -> Self { ProcessId::Windows(std::ptr::null_mut()) }
+
+  #[cfg(target_os = "linux")]
+  fn default() -> Self { ProcessId::Linux(0) }
 }
 
 /// # Usage
@@ -141,66 +167,83 @@ impl OwnedMem {
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
 pub enum HookType {
   #[default]
-  NoAlloc,
+  Patch,
   AllocNoOrg,
   AllocWithOrg,
 }
 
-#[derive(Clone, Debug)]
+// #[derive(Clone, Debug, Default)]
+// pub struct HookKing {
+//   process: Arc<RwLock<ProcessId>>,
+
+//   owned_mems: Arc<RwLock<Vec<Arc<RwLock<OwnedMem>>>>>,
+//   owned_mems_address: Arc<RwLock<HashMap<usize, Arc<RwLock<OwnedMem>>>>>,
+
+//   hooks: Arc<RwLock<Vec<Arc<RwLock<HookInfo>>>>>,
+//   hooks_name: Arc<RwLock<HashMap<String, Arc<RwLock<HookInfo>>>>>,
+//   hooks_index: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
+//   hooks_address: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
+// }
+
+#[derive(Clone, Debug, Default)]
 pub struct HookKing {
-  process: Arc<RwLock<*mut std::ffi::c_void>>,
+  // process id - can keep as Arc<RwLock> if you update it
+  process: Arc<RwLock<ProcessId>>,
 
-  owned_mems: Arc<RwLock<Vec<Arc<RwLock<OwnedMem>>>>>,
-  owned_mems_address: Arc<RwLock<HashMap<usize, Arc<RwLock<OwnedMem>>>>>,
+  // OwnedMem indexed by index (usize)
+  owned_mems: DashMap<usize, OwnedMem>,
+  // Map address -> index of OwnedMem
+  owned_mems_address: DashMap<usize, usize>,
 
-  hooks: Arc<RwLock<Vec<Arc<RwLock<HookInfo>>>>>,
-  hooks_name: Arc<RwLock<HashMap<String, Arc<RwLock<HookInfo>>>>>,
-  hooks_index: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
-  hooks_address: Arc<RwLock<HashMap<usize, Arc<RwLock<HookInfo>>>>>,
-}
-
-impl Default for HookKing {
-  fn default() -> Self {
-    return Self {
-      process: Arc::new(RwLock::new(std::ptr::null_mut())),
-      owned_mems: Arc::new(RwLock::new(Vec::new())),
-      owned_mems_address: Arc::new(RwLock::new(HashMap::new())),
-      hooks: Arc::new(RwLock::new(Vec::new())),
-      hooks_name: Arc::new(RwLock::new(HashMap::new())),
-      hooks_index: Arc::new(RwLock::new(HashMap::new())),
-      hooks_address: Arc::new(RwLock::new(HashMap::new())),
-    };
-  }
+  // Hooks indexed by index (usize)
+  hooks: DashMap<usize, HookInfo>,
+  // Map name -> index
+  hooks_name: DashMap<String, usize>,
+  // Map address -> index
+  hooks_address: DashMap<usize, usize>,
 }
 
 impl HookKing {
-  pub fn new(process: *mut std::ffi::c_void) -> Self { Self { process: Arc::new(RwLock::new(process)), ..Default::default() } }
+  pub fn new(process: Option<ProcessId>) -> Self {
+    let process = if let Some(proc) = process { proc } else { Self::current_process() };
 
-  pub fn change_process(&mut self, process: Option<*mut std::ffi::c_void>) { if process.is_some() { self.process = Arc::new(RwLock::new(process.unwrap())) } else { self.process = Arc::new(RwLock::new(unsafe { GetCurrentProcess() as _ })) } }
-
-  pub fn get_hook_by_name(&self, name: &str) -> Option<Arc<RwLock<HookInfo>>> { self.hooks_name.read().get(name).cloned() }
-
-  pub fn get_hook_by_index(&self, index: usize) -> Option<Arc<RwLock<HookInfo>>> { self.hooks_index.read().get(&index).cloned() }
-
-  pub fn get_hook_by_address(&self, address: usize) -> Option<Arc<RwLock<HookInfo>>> { self.hooks_address.read().get(&address).cloned() }
-
-  pub fn get_owned_mem_by_address(&self, address: usize) -> Option<Arc<RwLock<OwnedMem>>> { self.owned_mems_address.read().get(&address).cloned() }
-
-  pub fn add_hook(&mut self, hook: HookInfo) {
-    let arw = Arc::new(RwLock::new(hook));
-    let index = self.hooks.read().len(); // current position will be the index
-
-    self.hooks.write().push(arw.clone());
-    self.hooks_name.write().insert(arw.read().name.clone(), arw.clone());
-    self.hooks_index.write().insert(index, arw.clone());
-    self.hooks_address.write().insert(arw.clone().read().address, arw);
+    Self { process: Arc::new(RwLock::new(process)), ..Default::default() }
   }
 
-  pub fn add_owned_mem(&mut self, owned_mem: OwnedMem) {
-    let arw = Arc::new(RwLock::new(owned_mem));
+  fn current_process() -> ProcessId {
+    #[cfg(windows)]
+    {
+      ProcessId::Windows(unsafe { GetCurrentProcess() as _ })
+    }
 
-    self.owned_mems.write().push(arw.clone());
-    self.owned_mems_address.write().insert(arw.clone().read().address, arw);
+    #[cfg(linux)]
+    {
+      let pid = process::id();
+      ProcessId::Linux(pid)
+    }
+  }
+
+  pub fn change_process(&mut self, process: Option<ProcessId>) { if process.is_some() { self.process = Arc::new(RwLock::new(process.unwrap())) } else { self.process = Arc::new(RwLock::new(Self::current_process())) } }
+
+  pub fn get_hook_by_name(&self, name: &str) -> Option<HookInfo> { self.hooks_name.get(name).and_then(|idx| self.hooks.get(idx.value()).map(|h| h.clone())) }
+
+  pub fn get_hook_by_address(&self, address: usize) -> Option<HookInfo> { self.hooks_address.get(&address).and_then(|idx| self.hooks.get(idx.value()).map(|h| h.clone())) }
+
+  pub fn get_hook_by_index(&self, index: usize) -> Option<HookInfo> { self.hooks.get(&index).map(|h| h.clone()) }
+
+  pub fn get_mem_by_index(&self, index: usize) -> Option<OwnedMem> { self.owned_mems.get(&index).map(|h| h.clone()) }
+
+  pub fn get_mem_by_address(&self, address: usize) -> Option<OwnedMem> { self.owned_mems_address.get(&address).and_then(|idx| self.owned_mems.get(idx.value()).map(|h| h.clone())) }
+
+  fn add_hook(&mut self, hook: HookInfo) {
+    self.hooks.insert(self.hooks.len(), hook.clone());
+    self.hooks_name.insert(hook.name.clone(), self.hooks_name.len());
+    self.hooks_address.insert(hook.address, self.hooks_address.len());
+  }
+
+  fn add_owned_mem(&mut self, owned_mem: OwnedMem) {
+    self.owned_mems.insert(self.owned_mems.len(), owned_mem.clone());
+    self.owned_mems_address.insert(owned_mem.address, self.owned_mems.len());
   }
 
   /// # Warning
@@ -271,7 +314,7 @@ impl HookKing {
       panic!("Not a valid address! {address:#X}");
     }
 
-    if hook_type == HookType::NoAlloc {
+    if hook_type == HookType::Patch {
       unprotect(address);
 
       let bytes = assemble(address, architecture, assembly).unwrap();
@@ -285,37 +328,43 @@ impl HookKing {
     }
 
     let required_size = estimate_required_size(address, architecture, &assembly)?;
-    let mem_index = OwnedMem::check_in_vec(address, required_size, self.owned_mems.clone());
+    let mem_index = OwnedMem::check_in_mem(address, required_size, &self.owned_mems);
 
-    // println!("{:X?}", owned_mems.clone().unwrap().read());
+    let mut mem = if let Some(mem_index) = mem_index { self.get_mem_by_index(mem_index).unwrap() } else { alloc(module_base)? };
 
-    if let Some(mem_index) = mem_index {
-      let mem = self.owned_mems.read()[mem_index].clone();
-      let bytes = assemble(address, architecture, assembly)?;
-      insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
+    let bytes = assemble(address, architecture, assembly)?;
+    insert_bytes(address, architecture, &mut mem, hook_type, bytes);
 
-      // println!("hook_info {:X?}", hook_info);
-      owned_mem.hooks.push(hook_info.clone());
-      owned_mems.clone().write()[mem_index] = owned_mem.clone();
-      // println!("{:X?}", owned_mems.clone().unwrap().read());
-      // println!("Appended {:X?}", owned_mem);
-    } else {
-      let mem = alloc(module_base)?;
-      let bytes = assemble(mem.address, architecture, assembly)?;
-      let mut owned_mem = insert_bytes(address, architecture, mem.clone(), hook_type, bytes);
+    self.add_owned_mem(mem.clone());
+    self.add_hook(hook_info.clone());
 
-      // println!("hook_info {:X?}", hook_info);
-      owned_mem.hooks.push(hook_info.clone());
-      owned_mems.write().push(owned_mem.clone());
-      // println!("{:X?}", owned_mems.clone().unwrap().read());
-      // println!("Allocated {:X?}", owned_mem);
-    }
+    println!("hook_info {:X?}", hook_info);
+    println!("Allocated {:X?}", mem);
 
     Ok(())
   }
 }
 
 fn process() -> HANDLE { unsafe { GetCurrentProcess() } }
+
+fn module_base(module: Option<&str>) -> usize {
+  let module_name = match module {
+    Some(name) => {
+      // Convert the Rust string to a null-terminated C string
+      match CString::new(name) {
+        Ok(c_str) => c_str.as_ptr(),
+        Err(_) => null(), // In case of error, pass NULL
+      }
+    }
+    None => null(), // NULL means get the handle of the calling process
+  };
+
+  // Call the Windows API function
+  let handle = unsafe { GetModuleHandleA(module_name) };
+
+  // Convert the handle to a usize
+  handle as usize
+}
 
 fn alloc(address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
   let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
@@ -361,25 +410,6 @@ fn alloc(address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
   Ok(new_mem)
 }
 
-fn module_base(module: Option<&str>) -> usize {
-  let module_name = match module {
-    Some(name) => {
-      // Convert the Rust string to a null-terminated C string
-      match CString::new(name) {
-        Ok(c_str) => c_str.as_ptr(),
-        Err(_) => null(), // In case of error, pass NULL
-      }
-    }
-    None => null(), // NULL means get the handle of the calling process
-  };
-
-  // Call the Windows API function
-  let handle = unsafe { GetModuleHandleA(module_name) };
-
-  // Convert the handle to a usize
-  handle as usize
-}
-
 fn estimate_required_size(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> Result<usize, Box<dyn std::error::Error>> {
   let bytes = assemble(address, architecture, assembly)?.len();
   Ok(bytes * 2)
@@ -403,13 +433,6 @@ fn assemble(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssemb
 
   let result = BlockEncoder::encode(architecture, block, BlockEncoderOptions::DONT_FIX_BRANCHES).expect("Failed at encoding");
   Ok(result.code_buffer)
-}
-
-#[derive(Clone, Debug, Default)]
-struct InstructionsInfo {
-  pub opcodes: Vec<String>,
-  pub instrs: Vec<Instruction>,
-  pub bytes: Vec<u8>,
 }
 
 /// returns the size of the original instruction(s) and required nopes if needed
@@ -578,8 +601,8 @@ fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn st
 /// ins_ddress: the address to insert the bytes at
 ///
 /// hook_address: the hooked address
-fn insert_bytes(src_address: usize, architecture: u32, owned_mem: Arc<RwLock<OwnedMem>>, hook_type: HookType, bytes: Vec<u8>) {
-  let dst_address = owned_mem.read().address + owned_mem.read().used;
+fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem, hook_type: HookType, bytes: Vec<u8>) {
+  let dst_address = owned_mem.address + owned_mem.used;
 
   let jump_size = get_jump_size(dst_address, src_address);
 
@@ -614,14 +637,14 @@ fn insert_bytes(src_address: usize, architecture: u32, owned_mem: Arc<RwLock<Own
 
     if hook_type == HookType::AllocWithOrg {
       place_bytes(dst_address + bytes.len(), ori_instr_info.bytes.clone());
-      owned_mem.write().inc_used(ori_instr_info.bytes.len()).unwrap();
+      owned_mem.inc_used(ori_instr_info.bytes.len()).unwrap();
     }
 
     // placing the return jump
     place_jump(ret_address_jump, jump_size, rva_ret_jmp);
 
-    owned_mem.write().inc_used(bytes.len()).unwrap();
-    owned_mem.write().inc_used(jump_size).unwrap();
+    owned_mem.inc_used(bytes.len()).unwrap();
+    owned_mem.inc_used(jump_size).unwrap();
 
     // println!("OwnedMem = {:#X?}", owned_mem);
   }

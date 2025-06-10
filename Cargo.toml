@@ -20,6 +20,7 @@ winapi = { version = "0.3.9", features = [
   "wow64apiset",
 ] }
 parking_lot = "0.12.4"
+dashmap = "=6.1.0"
 
 [dev-dependencies]
 
