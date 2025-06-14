@@ -467,7 +467,7 @@ impl HookKing {
   ///      let hook_info = HookInfo::new(
   ///        "Something_3",
   ///        module_base + 0x589220,
-  ///        HookType::Detour,
+  ///        HookType::Patch,
   ///        assemble!(
   ///          mov rax,rbx;
   ///        ),

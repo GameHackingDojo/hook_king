@@ -21,7 +21,7 @@ keywords = [
   "interception",
 ]
 categories = ["memory-management", "os", "embedded", "system"]
-documentation = "https://docs.rs/your-crate"
+documentation = "https://docs.rs/hook_king"
 readme = "README.md"
 
 [dependencies]
