@@ -10,5 +10,3 @@ A low-level automated hooking library providing detours, trampolines, and memory
 - **Cross-Process Support**: Hook both internal and external processes
 - **Original Code Preservation**: Optional preservation of overwritten instructions
 - **x86/x64 Support**: Works with both 32-bit and 64-bit architectures
-
-## Installation
