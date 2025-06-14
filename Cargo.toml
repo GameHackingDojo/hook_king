@@ -8,18 +8,7 @@ license = "GPL-3.0"
 repository = "https://github.com/GameHackingDojo/hook_king"
 license-file = "LICENSE"
 
-keywords = [
-  "hook",
-  "detour",
-  "trampoline",
-  "memory",
-  "hooking",
-  "assembly",
-  "inline-hooking",
-  "function-hook",
-  "code-injection",
-  "interception",
-]
+keywords = ["hook", "detour", "trampoline", "assembly", "code-injection"]
 categories = ["memory-management", "os", "embedded", "system"]
 documentation = "https://docs.rs/hook_king"
 readme = "README.md"
