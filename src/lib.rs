@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 use parking_lot::RwLock;
 use std::{ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
+use winapi::um::memoryapi::WriteProcessMemory;
 #[cfg(target_os = "windows")]
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
@@ -103,22 +104,23 @@ impl Default for HookInfo {
 impl HookInfo {
   pub fn new(name: &str, address: usize, typ: HookType, assembly: Arc<dyn Fn(&mut CodeAssembler) + Send + Sync + 'static>) -> Self { Self { name: name.to_string(), address, typ, assembly, ..Default::default() } }
 
-  pub fn enable(&mut self) {
+  pub fn enable(&mut self, hook_king: &HookKing) {
     let address = self.address;
     let mem_address = self.jumping_address;
     let jmp_size = get_jmp_size(self.address, self.jumping_address);
     if self.org_nops > 0 {
-      place_nops(address, self.org_nops, jmp_size);
+      let nops = hook_king.get_nop_bytes(self.org_nops);
+      hook_king.place_bytes(address, nops).unwrap();
     }
     let offset = get_jump_offset(address, mem_address) as usize;
-    place_jump(address, jmp_size, offset);
-
+    let jmp_bytes = hook_king.get_jump_bytes(jmp_size, offset);
+    hook_king.place_bytes(address, jmp_bytes).unwrap();
     self.enabled = true;
   }
 
-  pub fn disable(&mut self) {
+  pub fn disable(&mut self, hook_king: &HookKing) {
     // println!("Address = {:#X?}, {:#X?}", self.address, self.org_bytes);
-    place_bytes(self.address, self.org_bytes.clone());
+    hook_king.place_bytes(self.address, self.org_bytes.clone()).unwrap();
 
     self.enabled = false;
   }
@@ -177,11 +179,10 @@ struct InstructionsInfo {
   pub nops: usize,
 }
 
-/// Enum to hold the process identifier (either a handle or a PID).
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum ProcessId {
-  Windows(*mut std::ffi::c_void), // Process handle for Windows
-  Linux(u32),                     // PID for Linux
+  Windows(*mut std::ffi::c_void),
+  Linux(u32),
 }
 
 unsafe impl Send for ProcessId {}
@@ -194,15 +195,6 @@ impl Default for ProcessId {
   #[cfg(target_os = "linux")]
   fn default() -> Self { ProcessId::Linux(0) }
 }
-
-/// # Usage
-///
-/// [`Patch`]: Does not allocate memory, places the instructions at the address and manges noping extra bytes if needed.
-///
-/// [`Detour`]: Allocates memeory near the address if possible, adds a jump to the allocated memory, places the instructions within the allocated memory and relocates the original instruction at the end of the added instructions.
-///
-/// [`DetourNoOrg`]: Allocates memeory near the address if possible, adds a jump to the allocated memory and places the instructions within the allocated memory without relocating the original instruction at the end of the added instructions.
-///
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum HookLookup {
@@ -225,6 +217,14 @@ impl Default for MemLookup {
   fn default() -> Self { MemLookup::Index(0) }
 }
 
+/// # Usage
+///
+/// [`Patch`]: Does not allocate memory, places the instructions at the address and manges noping extra bytes if needed.
+///
+/// [`Detour`]: Allocates memeory near the address if possible, adds a jump to the allocated memory, places the instructions within the allocated memory and relocates the original instruction at the end of the added instructions.
+///
+/// [`DetourNoOrg`]: Allocates memeory near the address if possible, adds a jump to the allocated memory and places the instructions within the allocated memory without relocating the original instruction at the end of the added instructions.
+///
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
 pub enum HookType {
   #[default]
@@ -233,21 +233,22 @@ pub enum HookType {
   DetourNoOrg,
 }
 
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
+enum AttachType {
+  #[default]
+  Internal,
+  External,
+  // Kernel,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HookKing {
-  // process id - can keep as Arc<RwLock> if you update it
-  process: Arc<RwLock<ProcessId>>,
-
-  // OwnedMem indexed by index (usize)
+  process: ProcessId,
+  attach_typ: AttachType,
   owned_mems: DashMap<usize, OwnedMem>,
-  // Map address -> index of OwnedMem
   owned_mems_address: DashMap<usize, usize>,
-
-  // Hooks indexed by index (usize)
   hooks: DashMap<usize, HookInfo>,
-  // Map name -> index
   hooks_name: DashMap<String, usize>,
-  // Map address -> index
   hooks_address: DashMap<usize, usize>,
 }
 
@@ -255,7 +256,7 @@ impl HookKing {
   pub fn new(process: Option<ProcessId>) -> Self {
     let process = if let Some(proc) = process { proc } else { Self::current_process() };
 
-    Self { process: Arc::new(RwLock::new(process)), ..Default::default() }
+    Self { process, ..Default::default() }
   }
 
   fn current_process() -> ProcessId {
@@ -271,7 +272,15 @@ impl HookKing {
     }
   }
 
-  pub fn change_process(&mut self, process: Option<ProcessId>) { if process.is_some() { self.process = Arc::new(RwLock::new(process.unwrap())) } else { self.process = Arc::new(RwLock::new(Self::current_process())) } }
+  pub fn change_process(&mut self, process: Option<ProcessId>) {
+    if process.is_some() {
+      self.attach_typ = AttachType::External;
+      self.process = process.unwrap()
+    } else {
+      self.attach_typ = AttachType::Internal;
+      self.process = Self::current_process();
+    }
+  }
 
   pub fn get_hook(&self, lookup: HookLookup) -> Option<HookInfo> {
     match lookup {
@@ -398,8 +407,8 @@ impl HookKing {
     let architecture = arch();
     let module_base = module_base(None);
 
-    if name.len() < 5 {
-      panic!("Give the hook a proper name. Name must be no less than 5 characters!")
+    if name.len() < 3 {
+      panic!("Give the hook a proper name. Name must be no less than 3 characters!")
     }
 
     let mut mbi = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
@@ -414,8 +423,10 @@ impl HookKing {
       let mut instr_info = instruction_info(address, bytes.len(), architecture);
       get_required_nops(&mut instr_info, 0);
 
-      place_nops(address, instr_info.nops - bytes.len(), bytes.len());
-      place_bytes(address, bytes);
+      let nop_bytes = self.get_nop_bytes(instr_info.nops - bytes.len());
+      self.place_bytes(address, nop_bytes)?;
+
+      self.place_bytes(address, bytes)?;
 
       return Ok(());
     }
@@ -426,7 +437,7 @@ impl HookKing {
     let mut mem = if let Some(index) = mem_index { self.get_mem(MemLookup::Index(index)).unwrap() } else { alloc(module_base)? };
 
     let bytes = assemble(address, architecture, assembly)?;
-    insert_bytes(address, architecture, &mut mem, &mut hook_info, bytes.clone())?;
+    self.insert_bytes(address, architecture, &mut mem, &mut hook_info, bytes.clone())?;
 
     // println!("org_instr_info.bytes = {:#X?}", hook_info.org_bytes);
     // println!("hook_info.jumping_address = {:#X}", hook_info.jumping_address);
@@ -443,6 +454,159 @@ impl HookKing {
     // println!("Allocated {:X?}", self.owned_mems);
 
     Ok(())
+  }
+
+  fn place_bytes(&self, address: usize, bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    match self.attach_typ {
+      AttachType::Internal => {
+        let address = address as *mut u8;
+        let address = unsafe { std::slice::from_raw_parts_mut(address, bytes.len()) };
+
+        for index in 0..bytes.len() {
+          (*address)[index] = bytes[index];
+        }
+
+        Ok(())
+      }
+      AttachType::External => {
+        #[cfg(target_os = "windows")]
+        {
+          let ProcessId::Windows(handle) = self.process else {
+            return Err("Invalid process handle for Windows".into());
+          };
+
+          // Ensure we have a valid handle
+          if handle.is_null() {
+            return Err("Null process handle".into());
+          }
+
+          // Get the length of the data to write
+          let size = bytes.len();
+          if size == 0 {
+            return Ok(()); // Nothing to write
+          }
+
+          let mut bytes_written = 0;
+          let result = unsafe { WriteProcessMemory(handle as _, address as *mut c_void, bytes.as_ptr() as *const c_void, size, &mut bytes_written) };
+
+          if result == 0 {
+            // Failed - get last error
+            let error = std::io::Error::last_os_error();
+            return Err(format!("WriteProcessMemory failed: {}", error).into());
+          }
+
+          if bytes_written != size {
+            return Err(format!("Only wrote {} of {} bytes", bytes_written, size).into());
+          }
+
+          Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+          Err("Linux implementation not provided".into())
+        }
+      }
+    }
+  }
+
+  /// src_address: the address to insert the bytes at
+  ///
+  /// hook_address: the hooked address
+  fn insert_bytes(&self, src_address: usize, architecture: u32, owned_mem: &mut OwnedMem, hook_info: &mut HookInfo, bytes: Vec<u8>) -> Result<(InstructionsInfo, usize), Box<dyn std::error::Error>> {
+    let dst_address = owned_mem.address + owned_mem.used;
+
+    let jmp_size = get_jmp_size(dst_address, src_address);
+
+    let rva_mem = get_jump_offset(src_address, dst_address);
+    // println!("rva_mem = {:#X?}", rva_mem);
+
+    unprotect(src_address);
+
+    // getting the instructions length covered by the jump
+    let mut org_instr_info = instruction_info(src_address, jmp_size, architecture);
+    get_required_nops(&mut org_instr_info, jmp_size);
+
+    // org_instr_info.nops = required_nops;
+
+    // println!("ori_instr_info = {:X?}", ori_instr_info);
+
+    let mut ret_address_jump = dst_address as usize + bytes.len() + org_instr_info.bytes.len();
+
+    if hook_info.typ == HookType::DetourNoOrg {
+      ret_address_jump = dst_address as usize + bytes.len();
+    }
+
+    if dst_address != 0 {
+      let rva_ret_jmp = get_ret_jump(src_address, dst_address, jmp_size, hook_info.typ.clone(), &mut org_instr_info, bytes.len());
+
+      // placing the hook jump
+      let hook_jmp = self.get_jump_bytes(jmp_size, rva_mem as usize);
+      self.place_bytes(src_address, hook_jmp).unwrap();
+
+      // placing nops if needed at the hooked address
+      let nops = self.get_nop_bytes(org_instr_info.nops);
+      self.place_bytes(src_address + jmp_size, nops).unwrap();
+
+      // placing the injected bytes
+      self.place_bytes(dst_address, bytes.clone())?;
+
+      if hook_info.typ == HookType::Detour {
+        self.place_bytes(dst_address + bytes.len(), org_instr_info.bytes.clone())?;
+        owned_mem.inc_used(org_instr_info.bytes.len()).unwrap();
+      }
+
+      // placing the return jump
+      let ret_jmp_bytes = self.get_jump_bytes(jmp_size, rva_ret_jmp);
+      self.place_bytes(ret_address_jump, ret_jmp_bytes).unwrap();
+
+      owned_mem.inc_used(bytes.len()).unwrap();
+      owned_mem.inc_used(jmp_size).unwrap();
+
+      // println!("OwnedMem = {:#X?}", owned_mem);
+    }
+
+    hook_info.jumping_address = dst_address;
+    hook_info.org_bytes = org_instr_info.bytes.clone();
+    hook_info.org_nops = org_instr_info.nops;
+    hook_info.jmp_size = jmp_size;
+
+    Ok((org_instr_info, dst_address))
+  }
+
+  fn get_nop_bytes(&self, length: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if length != 0 {
+      for _ in 0..length {
+        bytes.push(0x90);
+      }
+    }
+
+    bytes
+  }
+
+  fn get_jump_bytes(&self, jmp_size: usize, offset: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+
+    if jmp_size == 5 {
+      bytes.push(0xE9);
+      let mut v = offset;
+      for _ in 0..4 {
+        bytes.push(v as u8);
+        v >>= 8;
+      }
+    } else if jmp_size == 14 {
+      let prefix = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+      bytes.extend_from_slice(&prefix);
+
+      let mut v = offset;
+      for _ in 0..8 {
+        bytes.push(v as u8);
+        v >>= 8;
+      }
+    }
+
+    bytes
   }
 }
 
@@ -586,49 +750,49 @@ fn opcode_display(architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> V
   opcodes
 }
 
-fn place_bytes(address: usize, bytes: Vec<u8>) {
-  let address = address as *mut u8;
-  let address = unsafe { std::slice::from_raw_parts_mut(address, bytes.len()) };
+// fn place_bytes(address: usize, bytes: Vec<u8>) {
+//   let address = address as *mut u8;
+//   let address = unsafe { std::slice::from_raw_parts_mut(address, bytes.len()) };
 
-  for index in 0..bytes.len() {
-    (*address)[index] = bytes[index];
-  }
-}
+//   for index in 0..bytes.len() {
+//     (*address)[index] = bytes[index];
+//   }
+// }
 
-/// offset is the length of the bytes placed before it
-fn place_nops(address: usize, length: usize, offset: usize) {
-  let address = address as *mut u8;
-  let address = unsafe { std::slice::from_raw_parts_mut(address, length + offset) };
+// /// offset is the length of the bytes placed before it
+// fn place_nops(address: usize, length: usize, offset: usize) {
+//   let address = address as *mut u8;
+//   let address = unsafe { std::slice::from_raw_parts_mut(address, length + offset) };
 
-  if length != 0 {
-    for i in 0..length {
-      (*address)[i + offset] = 0x90;
-    }
-  }
-}
+//   if length != 0 {
+//     for i in 0..length {
+//       (*address)[i + offset] = 0x90;
+//     }
+//   }
+// }
 
-/// [offset]: is the offset or address to jump to. Address is needed in case the jump size is 14.
-fn place_jump(address: usize, jmp_size: usize, offset: usize) {
-  let address = address as *mut u8;
-  let address = unsafe { std::slice::from_raw_parts_mut(address, 50) };
+// /// [offset]: is the offset or address to jump to. Address is needed in case the jump size is 14.
+// fn place_jump(address: usize, jmp_size: usize, offset: usize) {
+//   let address = address as *mut u8;
+//   let address = unsafe { std::slice::from_raw_parts_mut(address, 50) };
 
-  if jmp_size == 5 {
-    (*address)[0] = 0xE9;
-    let mut v = offset;
-    for p in &mut (*address)[1..5] {
-      *p = v as u8;
-      v >>= 8;
-    }
-  } else if jmp_size == 14 {
-    let prefix = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
-    address[..prefix.len()].copy_from_slice(&prefix);
-    let mut v = offset;
-    for p in &mut address[6..14] {
-      *p = v as u8;
-      v >>= 8;
-    }
-  }
-}
+//   if jmp_size == 5 {
+//     (*address)[0] = 0xE9;
+//     let mut v = offset;
+//     for p in &mut (*address)[1..5] {
+//       *p = v as u8;
+//       v >>= 8;
+//     }
+//   } else if jmp_size == 14 {
+//     let prefix = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+//     address[..prefix.len()].copy_from_slice(&prefix);
+//     let mut v = offset;
+//     for p in &mut address[6..14] {
+//       *p = v as u8;
+//       v >>= 8;
+//     }
+//   }
+// }
 
 fn get_required_nops(instr_info: &mut InstructionsInfo, jmp_size: usize) {
   let mut length = 0;
@@ -698,66 +862,66 @@ fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn st
   Ok(if is_wow64 == 0 { 64 } else { 32 })
 }
 
-/// src_address: the address to insert the bytes at
-///
-/// hook_address: the hooked address
-fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem, hook_info: &mut HookInfo, bytes: Vec<u8>) -> Result<(InstructionsInfo, usize), Box<dyn std::error::Error>> {
-  let dst_address = owned_mem.address + owned_mem.used;
+// /// src_address: the address to insert the bytes at
+// ///
+// /// hook_address: the hooked address
+// fn insert_bytes(src_address: usize, architecture: u32, owned_mem: &mut OwnedMem, hook_info: &mut HookInfo, bytes: Vec<u8>) -> Result<(InstructionsInfo, usize), Box<dyn std::error::Error>> {
+//   let dst_address = owned_mem.address + owned_mem.used;
 
-  let jmp_size = get_jmp_size(dst_address, src_address);
+//   let jmp_size = get_jmp_size(dst_address, src_address);
 
-  let rva_mem = get_jump_offset(src_address, dst_address);
-  // println!("rva_mem = {:#X?}", rva_mem);
+//   let rva_mem = get_jump_offset(src_address, dst_address);
+//   // println!("rva_mem = {:#X?}", rva_mem);
 
-  unprotect(src_address);
+//   unprotect(src_address);
 
-  // getting the instructions length covered by the jump
-  let mut org_instr_info = instruction_info(src_address, jmp_size, architecture);
-  get_required_nops(&mut org_instr_info, jmp_size);
+//   // getting the instructions length covered by the jump
+//   let mut org_instr_info = instruction_info(src_address, jmp_size, architecture);
+//   get_required_nops(&mut org_instr_info, jmp_size);
 
-  // org_instr_info.nops = required_nops;
+//   // org_instr_info.nops = required_nops;
 
-  // println!("ori_instr_info = {:X?}", ori_instr_info);
+//   // println!("ori_instr_info = {:X?}", ori_instr_info);
 
-  let mut ret_address_jump = dst_address as usize + bytes.len() + org_instr_info.bytes.len();
+//   let mut ret_address_jump = dst_address as usize + bytes.len() + org_instr_info.bytes.len();
 
-  if hook_info.typ == HookType::DetourNoOrg {
-    ret_address_jump = dst_address as usize + bytes.len();
-  }
+//   if hook_info.typ == HookType::DetourNoOrg {
+//     ret_address_jump = dst_address as usize + bytes.len();
+//   }
 
-  if dst_address != 0 {
-    let rva_ret_jmp = get_ret_jump(src_address, dst_address, jmp_size, hook_info.typ.clone(), &mut org_instr_info, bytes.len());
+//   if dst_address != 0 {
+//     let rva_ret_jmp = get_ret_jump(src_address, dst_address, jmp_size, hook_info.typ.clone(), &mut org_instr_info, bytes.len());
 
-    // placing the hook jump
-    place_jump(src_address, jmp_size, rva_mem as usize);
+//     // placing the hook jump
+//     place_jump(src_address, jmp_size, rva_mem as usize);
 
-    // placing nops if needed at the hooked address
-    place_nops(src_address, org_instr_info.nops, jmp_size);
+//     // placing nops if needed at the hooked address
+//     place_nops(src_address, org_instr_info.nops, jmp_size);
 
-    // placing the injected bytes
-    place_bytes(dst_address, bytes.clone());
+//     // placing the injected bytes
+//     place_bytes(dst_address, bytes.clone());
 
-    if hook_info.typ == HookType::Detour {
-      place_bytes(dst_address + bytes.len(), org_instr_info.bytes.clone());
-      owned_mem.inc_used(org_instr_info.bytes.len()).unwrap();
-    }
+//     if hook_info.typ == HookType::Detour {
+//       place_bytes(dst_address + bytes.len(), org_instr_info.bytes.clone());
+//       owned_mem.inc_used(org_instr_info.bytes.len()).unwrap();
+//     }
 
-    // placing the return jump
-    place_jump(ret_address_jump, jmp_size, rva_ret_jmp);
+//     // placing the return jump
+//     place_jump(ret_address_jump, jmp_size, rva_ret_jmp);
 
-    owned_mem.inc_used(bytes.len()).unwrap();
-    owned_mem.inc_used(jmp_size).unwrap();
+//     owned_mem.inc_used(bytes.len()).unwrap();
+//     owned_mem.inc_used(jmp_size).unwrap();
 
-    // println!("OwnedMem = {:#X?}", owned_mem);
-  }
+//     // println!("OwnedMem = {:#X?}", owned_mem);
+//   }
 
-  hook_info.jumping_address = dst_address;
-  hook_info.org_bytes = org_instr_info.bytes.clone();
-  hook_info.org_nops = org_instr_info.nops;
-  hook_info.jmp_size = jmp_size;
+//   hook_info.jumping_address = dst_address;
+//   hook_info.org_bytes = org_instr_info.bytes.clone();
+//   hook_info.org_nops = org_instr_info.nops;
+//   hook_info.jmp_size = jmp_size;
 
-  Ok((org_instr_info, dst_address))
-}
+//   Ok((org_instr_info, dst_address))
+// }
 
 fn get_region_size(address: usize) -> Result<usize, Box<dyn std::error::Error>> {
   let mut mem_info = unsafe { zeroed() };
