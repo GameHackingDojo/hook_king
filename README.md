@@ -2,6 +2,9 @@
 
 A low-level automated hooking library providing detours, trampolines, and memory management capabilities. Supports both internal and external process hooking with optional original code preservation.
 
+## **THIS CRATE DEPENDS ON iced-x86**
+  **ADD iced-x86 to your cargo.toml with (features = ["code_asm"])**
+
 ## Features
 
 - **Function Hooking**: Intercept function calls with detours
@@ -12,17 +15,13 @@ A low-level automated hooking library providing detours, trampolines, and memory
 - **x86/x64 Support**: Works with both 32-bit and 64-bit architectures
 
 
-   ## Warning
-
-  **THIS CRATE DEPENDS ON iced-x86**
-  **ADD iced-x86 to your cargo.toml with (features = ["code_asm"])**
-
+## Warning
    Not giving a name or providing an invalid address will result in panicing
 
    Give the hook a proper name. Name must be no less than 3 characters!
 
 
-   ## Example
+## Example
 
    ```rust
    use hook_king::*;
@@ -72,7 +71,7 @@ A low-level automated hooking library providing detours, trampolines, and memory
    }
    ```
 
-   ## Example
+## Example
 
    ```rust
    use hook_king::*;
