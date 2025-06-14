@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
-use parking_lot::RwLock;
-use std::{ffi::CString, mem::zeroed, ptr::null, sync::{Arc, OnceLock}};
+use std::{ffi::CString, sync::{Arc, OnceLock}};
 use winapi::um::memoryapi::WriteProcessMemory;
 #[cfg(target_os = "windows")]
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
@@ -54,8 +53,8 @@ macro_rules! assemble {
     ($($tt:tt)*) => {
         std::sync::Arc::new(move |assembler: &mut iced_x86::code_asm::CodeAssembler|  {
             use iced_x86::code_asm::*;
-            use crate::assemble_1;
-            crate::assemble_1!(assembler,
+            use hook_king::assemble_1;
+            hook_king::assemble_1!(assembler,
                 $($tt)*
             );
         })
@@ -102,8 +101,17 @@ impl Default for HookInfo {
 }
 
 impl HookInfo {
+  ///
+  /// Create new hook
+  /// It must be provided with a name no shorter than 3 characters, or else it will panic
+  /// The hook is enabled by default
+  ///
   pub fn new(name: &str, address: usize, typ: HookType, assembly: Arc<dyn Fn(&mut CodeAssembler) + Send + Sync + 'static>) -> Self { Self { name: name.to_string(), address, typ, assembly, ..Default::default() } }
 
+  ///
+  /// Enable the hook in case was previously disabled.
+  /// A new hook is enabled by default
+  ///
   pub fn enable(&mut self, hook_king: &HookKing) {
     let address = self.address;
     let mem_address = self.jumping_address;
@@ -118,12 +126,24 @@ impl HookInfo {
     self.enabled = true;
   }
 
+  ///
+  /// Disable the hook and place the original bytes back to place
+  ///
   pub fn disable(&mut self, hook_king: &HookKing) {
     // println!("Address = {:#X?}, {:#X?}", self.address, self.org_bytes);
     hook_king.place_bytes(self.address, self.org_bytes.clone()).unwrap();
 
     self.enabled = false;
   }
+
+  /// Return the name of the hook
+  pub fn name(&self) -> &str { &self.name }
+
+  /// Return the address the hooked
+  pub fn address(&self) -> usize { self.address }
+
+  /// Return the address of the detour
+  pub fn jumping_address(&self) -> usize { self.jumping_address }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -135,7 +155,7 @@ pub struct OwnedMem {
 
 impl OwnedMem {
   /// increase the used memory propery
-  pub fn inc_used(&mut self, size: usize) -> Result<(), Box<dyn std::error::Error>> {
+  fn inc_used(&mut self, size: usize) -> Result<(), Box<dyn std::error::Error>> {
     if self.used + size < self.size {
       self.used += size;
 
@@ -146,18 +166,18 @@ impl OwnedMem {
   }
 
   /// ckeck given address is near the owned memory location
-  pub fn is_nearby(&self, address: usize) -> bool {
+  fn is_nearby(&self, address: usize) -> bool {
     const RANGE: usize = i32::MAX as usize; // 2 GB
     self.address.abs_diff(address) <= RANGE
   }
 
   /// check if the there is enough memory
-  pub fn is_mem_enough(&self, required_size: usize) -> bool {
+  fn is_mem_enough(&self, required_size: usize) -> bool {
     let available = self.size.saturating_sub(self.used + SAFETY);
     required_size <= available
   }
 
-  pub fn check_in_mem(address: usize, required_size: usize, owned_mems: &DashMap<usize, OwnedMem>) -> Option<usize> {
+  fn check_in_mem(address: usize, required_size: usize, owned_mems: &DashMap<usize, OwnedMem>) -> Option<usize> {
     // Iterate through all entries in the DashMap
     for entry in owned_mems.iter() {
       let (key, value) = entry.pair();
@@ -168,6 +188,15 @@ impl OwnedMem {
 
     None
   }
+
+  /// Returns the address of the managed memory
+  pub fn address(&self) -> usize { self.address }
+
+  /// Returns the size of the managed memory
+  pub fn size(&self) -> usize { self.size }
+
+  /// Returns the used size of the managed memory
+  pub fn used(&self) -> usize { self.used }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -217,13 +246,12 @@ impl Default for MemLookup {
   fn default() -> Self { MemLookup::Index(0) }
 }
 
-/// # Usage
 ///
-/// [`Patch`]: Does not allocate memory, places the instructions at the address and manges noping extra bytes if needed.
+/// `Patch`: Does not allocate memory, places the instructions at the address and manges noping extra bytes if needed.
 ///
-/// [`Detour`]: Allocates memeory near the address if possible, adds a jump to the allocated memory, places the instructions within the allocated memory and relocates the original instruction at the end of the added instructions.
+/// `Detour`: Allocates memeory near the address if possible, adds a jump to the allocated memory, places the instructions within the allocated memory and relocates the original instruction at the end of the added instructions.
 ///
-/// [`DetourNoOrg`]: Allocates memeory near the address if possible, adds a jump to the allocated memory and places the instructions within the allocated memory without relocating the original instruction at the end of the added instructions.
+/// `DetourNoOrg`: Allocates memeory near the address if possible, adds a jump to the allocated memory and places the instructions within the allocated memory without relocating the original instruction at the end of the added instructions.
 ///
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
 pub enum HookType {
@@ -241,6 +269,9 @@ enum AttachType {
   // Kernel,
 }
 
+///
+/// Create once and use it for all the hooks.
+///
 #[derive(Clone, Debug, Default)]
 pub struct HookKing {
   process: ProcessId,
@@ -253,6 +284,10 @@ pub struct HookKing {
 }
 
 impl HookKing {
+  ///
+  /// Initialise a HookKing instance to use all over your program.
+  /// Passing None will hook the current process (internal) otherwise you should provide the process handle (Windows) or process id (Linux).
+  ///
   pub fn new(process: Option<ProcessId>) -> Self {
     let process = if let Some(proc) = process { proc } else { Self::current_process() };
 
@@ -272,6 +307,7 @@ impl HookKing {
     }
   }
 
+  /// update the process handle, None for internal
   pub fn change_process(&mut self, process: Option<ProcessId>) {
     if process.is_some() {
       self.attach_typ = AttachType::External;
@@ -282,6 +318,7 @@ impl HookKing {
     }
   }
 
+  /// search for a previously placed hook by name, address or index
   pub fn get_hook(&self, lookup: HookLookup) -> Option<HookInfo> {
     match lookup {
       HookLookup::Name(name) => self.hooks_name.get_mut(&name).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())),
@@ -290,22 +327,13 @@ impl HookKing {
     }
   }
 
+  /// search for a previously allocated memory by address or index
   pub fn get_mem(&self, lookup: MemLookup) -> Option<OwnedMem> {
     match lookup {
       MemLookup::Address(address) => self.owned_mems_address.get_mut(&address).and_then(|idx| self.owned_mems.get_mut(idx.value()).map(|h| h.clone())),
       MemLookup::Index(index) => self.owned_mems.get_mut(&index).map(|h| h.clone()),
     }
   }
-
-  // pub fn get_hook_by_name(&self, name: &str) -> Option<HookInfo> { self.hooks_name.get_mut(name).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())) }
-
-  // pub fn get_hook_by_address(&self, address: usize) -> Option<HookInfo> { self.hooks_address.get_mut(&address).and_then(|idx| self.hooks.get_mut(idx.value()).map(|h| h.clone())) }
-
-  // pub fn get_hook_by_index(&self, index: usize) -> Option<HookInfo> { self.hooks.get_mut(&index).map(|h| h.clone()) }
-
-  // pub fn get_mem_by_index(&self, index: usize) -> Option<OwnedMem> { self.owned_mems.get_mut(&index).map(|h| h.clone()) }
-
-  // pub fn get_mem_by_address(&self, address: usize) -> Option<OwnedMem> { self.owned_mems_address.get_mut(&address).and_then(|idx| self.owned_mems.get_mut(idx.value()).map(|h| h.clone())) }
 
   fn add_hook(&mut self, hook: HookInfo) {
     self.hooks.insert(self.hooks.len(), hook.clone());
@@ -351,53 +379,135 @@ impl HookKing {
   ///
   /// Not giving a name or providing an invalid address will result in panicing
   ///
-  /// Give the hook a proper name. Name must be no less than 5 characters!
+  /// Give the hook a proper name. Name must be no less than 3 characters!
   ///
   /// # Example
   /// ```
-  ///let module_base: usize = 0x40000000;
-  ///asm_hook(
-  /// "infinite_money",
-  ///  module_base + 0x428A43,
-  ///  HookType::AllocWithOrg,
-  ///  assemble!(
-  ///    push rax;
-  ///    mov rax,rcx;
-  ///    mov byte ptr [rax+50],2;
-  ///    mov word ptr [rax+50*4],2;
-  ///    mov dword ptr [rax+rax*8+50],2;
-  ///    mov qword ptr [rax],2;
-  ///    label:
-  ///    mov rsp,rsi;
-  ///    mov r12d,4;
-  ///    mov r12w,4;
-  ///    mov r12b,4;
-  ///    mov r12b,4;
-  ///    jmp label;
-  ///    movups xmm1,xmm0;
-  ///    sub rsp,100;
-  ///    call rax;
-  ///    call module_base as u64;
-  ///    xor al,bl;
-  ///    xorps xmm0,xmm10;
-  ///    add rsp,100;
-  ///    pop rax;
-  ///    call module_base as u64 + 0x428C16;
-  ///    jmp module_base as u64 + 0x428AAC;
-  ///    ret;
-  ///    ret;
-  ///    ret_1 1;
-  ///    mpsadbw xmm0, xmm1, 2;
-  ///    vsqrtps ymm10, dword ptr [rcx];
-  ///    label_return:
-  ///    ret;
-  ///  ),
-  ///);
+  ///  use hook_king::*;
+  ///  use winapi::um::libloaderapi::GetModuleHandleA;
+  ///
+  /// fn internal_detour() {
+  ///  let module_base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
+  ///  let mut hook_king = HookKing::default();
+  ///  let hook_info = HookInfo::new(
+  ///    "health",
+  ///    module_base + 0x12321,
+  ///    HookType::Detour,
+  ///    assemble!(
+  ///      push rax;
+  ///      mov rax,rcx;
+  ///      mov byte ptr [rax+50],2;
+  ///      mov word ptr [rax+50*4],2;
+  ///      mov dword ptr [rax+rax*8+50],2;
+  ///      mov qword ptr [rax],2;
+  ///      // label:
+  ///      mov rsp,rsi;
+  ///      mov r12d,4;
+  ///      mov r12w,4;
+  ///      mov r12b,4;
+  ///      mov r12b,4;
+  ///      // jmp label;
+  ///      movups xmm1,xmm0;
+  ///      sub rsp,100;
+  ///      call rax;
+  ///      call module_base as u64;
+  ///      xor al,bl;
+  ///      xorps xmm0,xmm10;
+  ///      add rsp,100;
+  ///      pop rax;
+  ///      call module_base as u64 + 0x428C16;
+  ///      jmp module_base as u64 + 0x428AAC;
+  ///      ret;
+  ///      ret;
+  ///      ret_1 1;
+  ///      mpsadbw xmm0, xmm1, 2;
+  ///      vsqrtps ymm10, dword ptr [rcx];
+  ///      // label_return:
+  ///      ret;
+  ///    )
+  ///  );
+  ///  unsafe { hook_king.hook(hook_info).unwrap() };
+  /// }
+  /// ```
+  /// # Example
+  /// ```
+  ///  use hook_king::*;
+  ///  use winapi::um::libloaderapi::GetModuleHandleA;
+  ///  use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
+  ///
+  /// fn my_hooks() {
+  ///    let hook_king = Arc::new(RwLock::new(HookKing::new(None)));
+  ///    let hook_king_c = Arc::clone(&hook_king);
+  ///
+  ///    let handle = std::thread::spawn(move || {
+  ///      let module_base = unsafe { GetModuleHandleA(null_mut()) } as usize;
+  ///      let hook_info = HookInfo::new(
+  ///        "Something",
+  ///        module_base,
+  ///        HookType::Detour,
+  ///        assemble!(
+  ///          push rax;
+  ///          pop rax;
+  ///        ),
+  ///      );
+  ///
+  ///      unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
+  ///
+  ///      let hook_info = HookInfo::new(
+  ///        "Something_2",
+  ///        module_base + 0x589E50,
+  ///        HookType::Detour,
+  ///        assemble!(
+  ///          mov rax,rcx;
+  ///        ),
+  ///      );
+  ///
+  ///      unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
+  ///
+  ///      let hook_info = HookInfo::new(
+  ///        "Something_3",
+  ///        module_base + 0x589220,
+  ///        HookType::Detour,
+  ///        assemble!(
+  ///          mov rax,rbx;
+  ///        ),
+  ///      );
+  ///
+  ///      unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
+  ///
+  ///      let hook_info = HookInfo::new(
+  ///        "Something_4",
+  ///        module_base + 0x124F15,
+  ///        HookType::DetourNoOrg,
+  ///        assemble!(
+  ///          mov r9,r12;
+  ///          xor r11,r11;
+  ///          add rax,20;
+  ///        ),
+  ///      );
+  ///
+  ///      unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
+  ///
+  ///      hook_king_c
+  ///    });
+  ///
+  ///    let hook_king_r = handle.join().unwrap();
+  ///
+  ///    sleep(Duration::from_secs(10));
+  ///
+  ///    let hook = hook_king_r.read().unwrap().get_hook(HookLookup::Name("Something_4".to_string()));
+  ///
+  ///    if hook.is_some() {
+  ///      println!("Found the hook");
+  ///      let mut hook = hook.unwrap();
+  ///      sleep(Duration::from_secs(10));
+  ///      hook.disable(&hook_king.read().unwrap());
+  ///      sleep(Duration::from_secs(10));
+  ///      hook.enable(&hook_king.read().unwrap());
+  ///    }
+  ///  }
   /// ```
 
-  // #[cfg(feature = "parking-lot")]
-  // #[cfg(feature = "std-lock")]
-  // pub unsafe fn asm_hook(&self, hook_info: HookInfo, owned_mems: Option<Arc<RwLock<Vec<OwnedMem>>>>) -> Result<(), Box<dyn std::error::Error>> {
   pub unsafe fn hook(&mut self, hook_info: HookInfo) -> Result<(), Box<dyn std::error::Error>> {
     let mut hook_info = hook_info;
     let name = hook_info.name.clone();
@@ -618,10 +728,10 @@ fn module_base(module: Option<&str>) -> usize {
       // Convert the Rust string to a null-terminated C string
       match CString::new(name) {
         Ok(c_str) => c_str.as_ptr(),
-        Err(_) => null(), // In case of error, pass NULL
+        Err(_) => std::ptr::null(), // In case of error, pass NULL
       }
     }
-    None => null(), // NULL means get the handle of the calling process
+    None => std::ptr::null(), // NULL means get the handle of the calling process
   };
 
   // Call the Windows API function
@@ -632,7 +742,7 @@ fn module_base(module: Option<&str>) -> usize {
 }
 
 fn alloc(address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
-  let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+  let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
   let mut current_address = address;
   let mut attempts = 0;
   let mut new_mem = OwnedMem::default();
@@ -924,8 +1034,52 @@ fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn st
 // }
 
 fn get_region_size(address: usize) -> Result<usize, Box<dyn std::error::Error>> {
-  let mut mem_info = unsafe { zeroed() };
+  let mut mem_info = unsafe { std::mem::zeroed() };
   let result = unsafe { VirtualQuery(address as *mut _, &mut mem_info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
 
   if result > 0 { Ok(mem_info.RegionSize) } else { Err("Failed to retrieve region size".into()) }
 }
+
+// #[test]
+// fn test() {
+//   let module_base: usize = 0x40000000;
+//   let mut hook_king = HookKing::default();
+//   let hook_info = HookInfo::new(
+//     "health",
+//     module_base + 0x12321,
+//     HookType::Detour,
+//     assemble!(
+//       push rax;
+//       mov rax,rcx;
+//       mov byte ptr [rax+50],2;
+//       mov word ptr [rax+50*4],2;
+//       mov dword ptr [rax+rax*8+50],2;
+//       mov qword ptr [rax],2;
+//       // label:
+//       mov rsp,rsi;
+//       mov r12d,4;
+//       mov r12w,4;
+//       mov r12b,4;
+//       mov r12b,4;
+//       // jmp label;
+//       movups xmm1,xmm0;
+//       sub rsp,100;
+//       call rax;
+//       call module_base as u64;
+//       xor al,bl;
+//       xorps xmm0,xmm10;
+//       add rsp,100;
+//       pop rax;
+//       call module_base as u64 + 0x428C16;
+//       jmp module_base as u64 + 0x428AAC;
+//       ret;
+//       ret;
+//       ret_1 1;
+//       mpsadbw xmm0, xmm1, 2;
+//       vsqrtps ymm10, dword ptr [rcx];
+//       // label_return:
+//       ret;
+//     ),
+//   );
+//   unsafe { hook_king.hook(hook_info).unwrap() };
+// }

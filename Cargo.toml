@@ -3,10 +3,26 @@ name = "hook_king"
 version = "0.1.0"
 edition = "2024"
 authors = ["Ken Masters <GameHackingDojo@gmail.com>"]
-description = "Automated efficient Assembly hooking library that works internally and externally for both x86/x64"
+description = "Low-level automated hooking library with detours, trampolines, and memory management. Supports internal/external process hooking with optional original code preservation."
 license = "GPL-3.0"
 repository = "https://github.com/GameHackingDojo/hook_king"
 license-file = "LICENSE"
+
+keywords = [
+  "hook",
+  "detour",
+  "trampoline",
+  "memory",
+  "hooking",
+  "assembly",
+  "inline-hooking",
+  "function-hook",
+  "code-injection",
+  "interception",
+]
+categories = ["memory-management", "os", "embedded", "system"]
+documentation = "https://docs.rs/your-crate"
+readme = "README.md"
 
 [dependencies]
 iced-x86 = { version = "1.21.0", features = ["code_asm"] }
@@ -19,7 +35,6 @@ winapi = { version = "0.3.9", features = [
   "memoryapi",
   "wow64apiset",
 ] }
-parking_lot = "0.12.4"
 dashmap = "=6.1.0"
 
 [dev-dependencies]
