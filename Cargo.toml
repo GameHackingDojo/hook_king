@@ -9,7 +9,12 @@ repository = "https://github.com/GameHackingDojo/hook_king"
 license-file = "LICENSE"
 
 keywords = ["hook", "detour", "trampoline", "assembly", "code-injection"]
-categories = ["memory-management", "os", "embedded", "system"]
+categories = [
+  "memory-management",
+  "os",
+  "development-tools::debugging",
+  "api-bindings",
+]
 documentation = "https://docs.rs/hook_king"
 readme = "README.md"
 
