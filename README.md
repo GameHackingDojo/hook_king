@@ -20,6 +20,7 @@ A low-level automated hooking library providing detours, trampolines, and memory
    
   
    ## Example
+  
    ```rust
     use hook_king::*;
     use winapi::um::libloaderapi::GetModuleHandleA;
@@ -69,7 +70,8 @@ A low-level automated hooking library providing detours, trampolines, and memory
    ```
 
    ## Example
-   ```
+  
+   ```rust
     use hook_king::*;
     use winapi::um::libloaderapi::GetModuleHandleA;
     use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
