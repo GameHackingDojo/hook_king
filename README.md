@@ -22,8 +22,8 @@ A low-level automated hooking library providing detours, trampolines, and memory
    ## Example
   
    ```rust
-    use hook_king::*;
-    use winapi::um::libloaderapi::GetModuleHandleA;
+   use hook_king::*;
+   use winapi::um::libloaderapi::GetModuleHandleA;
   
    fn internal_detour() {
     let module_base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
@@ -72,9 +72,9 @@ A low-level automated hooking library providing detours, trampolines, and memory
    ## Example
   
    ```rust
-    use hook_king::*;
-    use winapi::um::libloaderapi::GetModuleHandleA;
-    use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
+   use hook_king::*;
+   use winapi::um::libloaderapi::GetModuleHandleA;
+   use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
   
    fn my_hooks() {
       let hook_king = Arc::new(RwLock::new(HookKing::new(None)));
