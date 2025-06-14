@@ -13,18 +13,21 @@ A low-level automated hooking library providing detours, trampolines, and memory
 
 
    ## Warning
-  
+
+  **THIS CRATE DEPENDS ON iced-x86**
+  **ADD iced-x86 to your cargo.toml with (features = ["code_asm"])**
+
    Not giving a name or providing an invalid address will result in panicing
-  
+
    Give the hook a proper name. Name must be no less than 3 characters!
-   
-  
+
+
    ## Example
-  
+
    ```rust
    use hook_king::*;
    use winapi::um::libloaderapi::GetModuleHandleA;
-  
+
    fn internal_detour() {
     let module_base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
     let mut hook_king = HookKing::default();
@@ -70,16 +73,16 @@ A low-level automated hooking library providing detours, trampolines, and memory
    ```
 
    ## Example
-  
+
    ```rust
    use hook_king::*;
    use winapi::um::libloaderapi::GetModuleHandleA;
    use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
-  
+
    fn my_hooks() {
       let hook_king = Arc::new(RwLock::new(HookKing::new(None)));
       let hook_king_c = Arc::clone(&hook_king);
-  
+
       let handle = std::thread::spawn(move || {
         let module_base = unsafe { GetModuleHandleA(null_mut()) } as usize;
         let hook_info = HookInfo::new(
@@ -91,9 +94,9 @@ A low-level automated hooking library providing detours, trampolines, and memory
             pop rax;
           ),
         );
-  
+
         unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
-  
+
         let hook_info = HookInfo::new(
           "Something_2",
           module_base + 0x589E50,
@@ -102,9 +105,9 @@ A low-level automated hooking library providing detours, trampolines, and memory
             mov rax,rcx;
           ),
         );
-  
+
         unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
-  
+
         let hook_info = HookInfo::new(
           "Something_3",
           module_base + 0x589220,
@@ -113,9 +116,9 @@ A low-level automated hooking library providing detours, trampolines, and memory
             mov rax,rbx;
           ),
         );
-  
+
         unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
-  
+
         let hook_info = HookInfo::new(
           "Something_4",
           module_base + 0x124F15,
@@ -126,18 +129,18 @@ A low-level automated hooking library providing detours, trampolines, and memory
             add rax,20;
           ),
         );
-  
+
         unsafe { hook_king_c.write().unwrap().hook(hook_info).unwrap() };
-  
+
         hook_king_c
       });
-  
+
       let hook_king_r = handle.join().unwrap();
-  
+
       sleep(Duration::from_secs(10));
-  
+
       let hook = hook_king_r.read().unwrap().get_hook(HookLookup::Name("Something_4".to_string()));
-  
+
       if hook.is_some() {
         println!("Found the hook");
         let mut hook = hook.unwrap();
