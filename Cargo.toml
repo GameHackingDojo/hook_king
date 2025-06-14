@@ -1,6 +1,6 @@
 [package]
 name = "hook_king"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Ken Masters <GameHackingDojo@gmail.com>"]
 description = "Low-level automated hooking library with detours, trampolines, and memory management. Supports internal/external process hooking with optional original code preservation."
