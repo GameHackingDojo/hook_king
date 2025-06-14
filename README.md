@@ -20,7 +20,7 @@ A low-level automated hooking library providing detours, trampolines, and memory
    
   
    ## Example
-   ```
+   ```rust
     use hook_king::*;
     use winapi::um::libloaderapi::GetModuleHandleA;
   
