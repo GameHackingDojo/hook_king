@@ -54,7 +54,7 @@ fn get_main_module_base_address(pid: u32) -> Result<usize, Box<dyn std::error::E
 
 fn main() {
   let process_id = get_pid("010Editor.exe").unwrap();
-  let process = ProcessId::Windows(unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, process_id) } as _);
+  let process = Process::Windows(unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, process_id) } as _);
 
   let module_handle = get_main_module_base_address(process_id).unwrap();
 

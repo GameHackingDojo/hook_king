@@ -1,9 +1,10 @@
 use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
-use std::{ffi::CString, sync::{Arc, OnceLock}};
-use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, VirtualQueryEx, WriteProcessMemory};
+use ntapi::{ntmmapi::{MemoryBasicInformation, NtAllocateVirtualMemory, NtQueryVirtualMemory}, ntpsapi::NtCurrentProcess};
+use std::{ffi::{CString, OsStr}, os::windows::ffi::OsStrExt, sync::{Arc, OnceLock}};
 #[cfg(target_os = "windows")]
 use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
+use winapi::{shared::ntdef::NT_SUCCESS, um::{errhandlingapi::GetLastError, handleapi::CloseHandle, memoryapi::{ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, VirtualQueryEx, WriteProcessMemory}, processthreadsapi::OpenProcess, tlhelp32::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS}, winnt::PROCESS_ALL_ACCESS}};
 
 #[macro_export]
 macro_rules! assemble_1 {
@@ -76,7 +77,7 @@ pub struct HookInfo {
   assembly: Arc<dyn Fn(&mut CodeAssembler) + Send + Sync + 'static>,
   org_bytes: Vec<u8>,
   org_nops: usize,
-  jmp_size: usize,
+  jmp_size: JmpSize,
   jumping_address: usize,
   enabled: bool,
 }
@@ -94,7 +95,7 @@ impl Default for HookInfo {
       assembly: Arc::new(|_: &mut CodeAssembler| {}),
       org_bytes: Vec::new(),
       org_nops: 0,
-      jmp_size: 0,
+      jmp_size: JmpSize::Near,
       jumping_address: 0,
       enabled: true,
     }
@@ -167,7 +168,7 @@ impl OwnedMem {
   }
 
   /// ckeck given address is near the owned memory location
-  fn is_nearby(&self, address: usize) -> bool {
+  fn is_nearby(&self, address: usize, jmp_size: JmpSize) -> bool {
     const RANGE: usize = i32::MAX as usize; // 2 GB
     self.address.abs_diff(address) <= RANGE
   }
@@ -178,11 +179,11 @@ impl OwnedMem {
     required_size <= available
   }
 
-  fn check_in_mem(address: usize, required_size: usize, owned_mems: &DashMap<usize, OwnedMem>) -> Option<usize> {
+  fn check_in_mem(address: usize, required_size: usize, owned_mems: &DashMap<usize, OwnedMem>, jmp_size: JmpSize) -> Option<usize> {
     // Iterate through all entries in the DashMap
     for entry in owned_mems.iter() {
       let (key, value) = entry.pair();
-      if value.is_nearby(address) && value.is_mem_enough(required_size) {
+      if value.is_nearby(address, jmp_size) && value.is_mem_enough(required_size) {
         return Some(*key);
       }
     }
@@ -210,34 +211,34 @@ struct InstructionsInfo {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum ProcessId {
+pub enum Process {
   Windows(*mut std::ffi::c_void),
   Linux(u32),
 }
 
-unsafe impl Send for ProcessId {}
-unsafe impl Sync for ProcessId {}
+unsafe impl Send for Process {}
+unsafe impl Sync for Process {}
 
-impl Default for ProcessId {
+impl Default for Process {
   #[cfg(target_os = "windows")]
-  fn default() -> Self { ProcessId::Windows(std::ptr::null_mut()) }
+  fn default() -> Self { Process::Windows(std::ptr::null_mut()) }
 
   #[cfg(target_os = "linux")]
-  fn default() -> Self { ProcessId::Linux(0) }
+  fn default() -> Self { Process::Linux(0) }
 }
 
-impl ProcessId {
+impl Process {
   #[cfg(target_os = "windows")]
-  pub fn get(&self) -> Option<*mut std::ffi::c_void> { if let ProcessId::Windows(ptr) = *self { Some(ptr) } else { None } }
+  pub fn get(&self) -> Option<*mut std::ffi::c_void> { if let Process::Windows(ptr) = *self { Some(ptr) } else { None } }
 
   #[cfg(target_os = "linux")]
-  pub fn get(self) -> Option<u32> { if let ProcessId::Linux(id) = self { Some(id) } else { None } }
+  pub fn get(self) -> Option<u32> { if let Process::Linux(id) = self { Some(id) } else { None } }
 
   #[cfg(target_os = "windows")]
   pub fn is_null(&self) -> bool {
     match self {
-      ProcessId::Windows(ptr) => ptr.is_null(),
-      ProcessId::Linux(num) => *num == 0,
+      Process::Windows(ptr) => ptr.is_null(),
+      Process::Linux(num) => *num == 0,
     }
   }
 }
@@ -286,12 +287,20 @@ enum AttachType {
   // Kernel,
 }
 
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
+enum JmpSize {
+  Short = 2,
+  #[default]
+  Near = 5,
+  Far = 14,
+}
+
 ///
 /// Create once and use it for all the hooks.
 ///
 #[derive(Clone, Debug, Default)]
 pub struct HookKing {
-  process: ProcessId,
+  process: Process,
   attach_typ: AttachType,
   owned_mems: DashMap<usize, OwnedMem>,
   owned_mems_address: DashMap<usize, usize>,
@@ -305,28 +314,28 @@ impl HookKing {
   /// Initialise a HookKing instance to use all over your program.
   /// Passing None will hook the current process (internal) otherwise you should provide the process handle (Windows) or process id (Linux).
   ///
-  pub fn new(process_id: Option<ProcessId>) -> Self {
-    let process = if let Some(proc) = process_id { proc } else { Self::current_process() };
-    let attach_typ = if process_id.is_some() { AttachType::External } else { AttachType::Internal };
+  pub fn new(process: Option<Process>) -> Self {
+    let proc = if let Some(process) = process { process } else { Self::current_process() };
+    let attach_typ = if process.is_some() { AttachType::External } else { AttachType::Internal };
 
-    Self { process, attach_typ, ..Default::default() }
+    Self { process: proc, attach_typ, ..Default::default() }
   }
 
-  fn current_process() -> ProcessId {
+  fn current_process() -> Process {
     #[cfg(target_os = "windows")]
     {
-      ProcessId::Windows(unsafe { GetCurrentProcess() as _ })
+      Process::Windows(unsafe { GetCurrentProcess() as _ })
     }
 
     #[cfg(target_os = "linux")]
     {
       let pid = process::id();
-      ProcessId::Linux(pid)
+      Process::Linux(pid)
     }
   }
 
   /// update the process handle, None for internal
-  pub fn set_process(&mut self, process: Option<ProcessId>) {
+  pub fn set_process(&mut self, process: Option<Process>) {
     if process.is_some() {
       self.process = process.unwrap();
       self.attach_typ = AttachType::External;
@@ -399,7 +408,8 @@ impl HookKing {
   ///
   /// Give the hook a proper name. Name must be no less than 3 characters!
   ///
-  /// # Example
+  /// # Example - Internal
+  ///
   /// ```
   ///  use hook_king::*;
   ///  use winapi::um::libloaderapi::GetModuleHandleA;
@@ -447,14 +457,20 @@ impl HookKing {
   ///  unsafe { hook_king.hook(hook_info).unwrap() };
   /// }
   /// ```
-  /// # Example
+  ///
+  /// # Example - External
+  ///
   /// ```
   ///  use hook_king::*;
   ///  use winapi::um::libloaderapi::GetModuleHandleA;
   ///  use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
   ///
-  /// fn my_hooks() {
-  ///    let hook_king = Arc::new(RwLock::new(HookKing::new(None)));
+  /// fn external_detour() {
+  ///    let process_id = HookKing::process_id("NieRAutomata.exe").unwrap();
+  ///    let process = HookKing::process(process_id).unwrap();
+  ///    let module_base = HookKing::module_base(None, process_id).unwrap();
+  ///
+  ///    let hook_king = Arc::new(RwLock::new(HookKing::new(Some(process))));
   ///    let hook_king_c = Arc::clone(&hook_king);
   ///
   ///    let handle = std::thread::spawn(move || {
@@ -571,7 +587,7 @@ impl HookKing {
     }
 
     let required_size = estimate_required_size(address, architecture, &assembly)?;
-    let mem_index = OwnedMem::check_in_mem(address, required_size, &self.owned_mems);
+    let mem_index = OwnedMem::check_in_mem(address, required_size, &self.owned_mems, JmpSize::Near);
 
     let mut mem = if let Some(index) = mem_index { self.get_mem(MemLookup::Index(index)).unwrap() } else { self.alloc(module_base)? };
 
@@ -608,6 +624,7 @@ impl HookKing {
   }
 
   fn write_bytes(&self, address: usize, bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    self.unprotect(address);
     match self.attach_typ {
       AttachType::Internal => {
         let address = address as *mut u8;
@@ -675,8 +692,8 @@ impl HookKing {
     self.unprotect(src_address);
 
     // getting the instructions length covered by the jump
-    let mut org_instr_info = self.instruction_info(src_address, jmp_size, architecture);
-    get_required_nops(&mut org_instr_info, jmp_size);
+    let mut org_instr_info = self.instruction_info(src_address, jmp_size as usize, architecture);
+    get_required_nops(&mut org_instr_info, jmp_size as usize);
 
     // println!("ori_instr_info = {:X?}", org_instr_info.bytes);
 
@@ -695,7 +712,7 @@ impl HookKing {
 
       // placing nops if needed at the hooked address
       let nops = self.get_nop_bytes(org_instr_info.nops);
-      self.write_bytes(src_address + jmp_size, nops).unwrap();
+      self.write_bytes(src_address + jmp_size as usize, nops).unwrap();
 
       // placing the injected bytes
       self.write_bytes(dst_address, bytes.clone())?;
@@ -710,7 +727,7 @@ impl HookKing {
       self.write_bytes(ret_address_jump, ret_jmp_bytes).unwrap();
 
       owned_mem.inc_used(bytes.len()).unwrap();
-      owned_mem.inc_used(jmp_size).unwrap();
+      owned_mem.inc_used(jmp_size as usize).unwrap();
 
       // println!("OwnedMem = {:#X?}", owned_mem);
     }
@@ -725,6 +742,7 @@ impl HookKing {
 
   /// returns the size of the original instruction(s) and required nopes if needed
   fn instruction_info(&self, address: usize, length: usize, architecture: u32) -> InstructionsInfo {
+    self.unprotect(address);
     let mut bytes = self.read_bytes(address, DEFAULT_BYTES_TO_READ).unwrap();
     // println!("{:02X?}", &bytes);
     let mut instrs_size = 0;
@@ -761,56 +779,99 @@ impl HookKing {
     match self.attach_typ {
       AttachType::Internal => Ok(unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length).to_vec() }),
       AttachType::External => {
-        let ProcessId::Windows(process) = self.process else {
+        let Process::Windows(process) = self.process else {
           return Err("Invalid process handle".into());
         };
         let mut bytes = vec![0u8; length];
         let mut bytes_read = 0;
 
-        if unsafe { ReadProcessMemory(process as _, address as _, bytes.as_mut_ptr() as *mut _, length, &mut bytes_read) == 1 } { Ok(bytes) } else { Err("Failed to read bytes".into()) }
+        if unsafe { ReadProcessMemory(process as _, address as _, bytes.as_mut_ptr() as *mut _, length, &mut bytes_read) == 1 } { Ok(bytes) } else { Err(format!("Failed to read bytes {:X?}", unsafe { GetLastError() }).into()) }
       }
     }
   }
 
+  // fn alloc(&self, address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
+  //   let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+  //   let mut current_address = address;
+  //   let mut attempts = 0;
+  //   let mut new_mem = OwnedMem::default();
+
+  //   while attempts < 100000 {
+  //     let mem_query = match self.attach_typ {
+  //       AttachType::Internal => unsafe { VirtualQuery(current_address as *mut c_void, &mut memory_info as *mut MEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION>()) },
+  //       AttachType::External => unsafe { VirtualQueryEx(self.process.get().unwrap() as _, current_address as *mut c_void, &mut memory_info as *mut MEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION>()) },
+  //     };
+
+  //     let status = unsafe { NtQueryVirtualMemory(self.process.get().unwrap() as _, current_address as _, MemoryBasicInformation, &mut mem_info, mem_info_size, &mut return_length) };
+
+  //     if mem_query > 0 {
+  //       if memory_info.State == MEM_FREE && memory_info.RegionSize >= PAGE_SIZE {
+  //         let alloc_mem = match self.attach_typ {
+  //           AttachType::Internal => unsafe { VirtualAlloc(current_address as *mut c_void, PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) },
+  //           AttachType::External => unsafe { VirtualAllocEx(self.process.get().unwrap() as _, current_address as *mut c_void, PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) },
+  //         };
+
+  //         if !alloc_mem.is_null() {
+  //           let size = get_region_size(alloc_mem as usize).unwrap();
+  //           new_mem = OwnedMem { address: alloc_mem as usize, size, ..Default::default() };
+
+  //           break;
+  //         }
+  //       }
+
+  //       // match self.attach_typ {
+  //       //   AttachType::Internal => current_address = memory_info.BaseAddress as usize - memory_info.RegionSize, // Move to NEXT region (backwards traversal)
+  //       //   AttachType::External => current_address = memory_info.BaseAddress as usize + memory_info.RegionSize, // Move to NEXT region (forewards traversal)
+  //       // }
+
+  //       current_address = memory_info.BaseAddress as usize - memory_info.RegionSize; // Move to NEXT region (backwards traversal)
+  //     } else {
+  //       current_address += PAGE_SIZE;
+  //     }
+
+  //     attempts += 1;
+  //     // println!("attempts = {}", attempts);
+  //   }
+
+  //   Ok(new_mem)
+  // }
+
   fn alloc(&self, address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
-    let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut mem_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut return_length: usize = 0;
     let mut current_address = address;
     let mut attempts = 0;
     let mut new_mem = OwnedMem::default();
 
     while attempts < 100000 {
-      let mem_query = match self.attach_typ {
-        AttachType::Internal => unsafe { VirtualQuery(current_address as *mut c_void, &mut memory_info as *mut MEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION>()) },
-        AttachType::External => unsafe { VirtualQueryEx(self.process.get().unwrap() as _, current_address as *mut c_void, &mut memory_info as *mut MEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION>()) },
+      let process_handle = match self.attach_typ {
+        AttachType::Internal => NtCurrentProcess,
+        AttachType::External => self.process.get().unwrap() as _,
       };
 
-      if mem_query > 0 {
-        if memory_info.State == MEM_FREE && memory_info.RegionSize >= PAGE_SIZE {
-          let alloc_mem = match self.attach_typ {
-            AttachType::Internal => unsafe { VirtualAlloc(current_address as *mut c_void, PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) },
-            AttachType::External => unsafe { VirtualAllocEx(self.process.get().unwrap() as _, current_address as *mut c_void, PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) },
-          };
+      let status = unsafe { NtQueryVirtualMemory(process_handle, current_address as _, MemoryBasicInformation, &mut mem_info as *mut _ as _, size_of::<MEMORY_BASIC_INFORMATION>(), &mut return_length as *mut _ as *mut _) };
 
-          if !alloc_mem.is_null() {
-            let size = get_region_size(alloc_mem as usize).unwrap();
-            new_mem = OwnedMem { address: alloc_mem as usize, size, ..Default::default() };
+      if NT_SUCCESS(status) {
+        if mem_info.State == MEM_FREE && mem_info.RegionSize >= PAGE_SIZE {
+          let mut base_address = current_address as _;
+          let mut region_size = PAGE_SIZE;
+
+          let alloc_status = unsafe { NtAllocateVirtualMemory(process_handle, &mut base_address, 0, &mut region_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
+
+          if NT_SUCCESS(alloc_status) && !base_address.is_null() {
+            let size = get_region_size(base_address as usize).unwrap(); // assuming your function works the same
+            new_mem = OwnedMem { address: base_address as usize, size, ..Default::default() };
 
             break;
           }
         }
 
-        // match self.attach_typ {
-        //   AttachType::Internal => current_address = memory_info.BaseAddress as usize - memory_info.RegionSize, // Move to NEXT region (backwards traversal)
-        //   AttachType::External => current_address = memory_info.BaseAddress as usize + memory_info.RegionSize, // Move to NEXT region (forewards traversal)
-        // }
-
-        current_address = memory_info.BaseAddress as usize - memory_info.RegionSize; // Move to NEXT region (backwards traversal)
+        current_address = mem_info.BaseAddress as usize - mem_info.RegionSize;
       } else {
         current_address += PAGE_SIZE;
       }
 
       attempts += 1;
-      // println!("attempts = {}", attempts);
     }
 
     Ok(new_mem)
@@ -827,28 +888,107 @@ impl HookKing {
     bytes
   }
 
-  fn get_jump_bytes(&self, jmp_size: usize, offset: usize) -> Vec<u8> {
+  fn get_jump_bytes(&self, jmp_size: JmpSize, offset: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
 
-    if jmp_size == 5 {
-      bytes.push(0xE9);
-      let mut v = offset;
-      for _ in 0..4 {
-        bytes.push(v as u8);
-        v >>= 8;
+    match jmp_size {
+      JmpSize::Short => todo!(),
+      JmpSize::Near => {
+        bytes.push(0xE9);
+        let mut v = offset;
+        for _ in 0..4 {
+          bytes.push(v as u8);
+          v >>= 8
+        }
       }
-    } else if jmp_size == 14 {
-      let prefix = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
-      bytes.extend_from_slice(&prefix);
+      JmpSize::Far => {
+        let prefix = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&prefix);
 
-      let mut v = offset;
-      for _ in 0..8 {
-        bytes.push(v as u8);
-        v >>= 8;
+        let mut v = offset;
+        for _ in 0..8 {
+          bytes.push(v as u8);
+          v >>= 8;
+        }
       }
     }
 
     bytes
+  }
+
+  /// get the process handle using the process id
+  #[cfg(target_os = "windows")]
+  pub fn process(process_id: u32) -> Result<Process, Box<dyn std::error::Error>> {
+    let process = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, process_id) };
+    if process.is_null() { Err(format!("Failed to open process, error {:X?}", unsafe { GetLastError() }).into()) } else { Ok(Process::Windows(process as _)) }
+  }
+
+  /// get the process_id from the name of the process
+  #[cfg(target_os = "windows")]
+  pub fn process_id(name: &str) -> Result<u32, String> {
+    unsafe {
+      let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+      if snapshot == std::ptr::null_mut() {
+        return Err(format!("CreateToolhelp32Snapshot failed {:X?}", GetLastError()));
+      }
+
+      let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+      entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+      if Process32First(snapshot, &mut entry) == 0 {
+        CloseHandle(snapshot);
+        return Err(format!("Process32First failed {:X?}", GetLastError()));
+      }
+
+      loop {
+        let exe_name_cstr = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr());
+        if let Ok(exe_name) = exe_name_cstr.to_str() {
+          if exe_name.eq_ignore_ascii_case(name) {
+            CloseHandle(snapshot);
+            return Ok(entry.th32ProcessID);
+          }
+        }
+
+        if Process32Next(snapshot, &mut entry) == 0 {
+          break;
+        }
+      }
+
+      CloseHandle(snapshot);
+      Err("Process not found".to_string())
+    }
+  }
+
+  /// get the passed module base address if none it will return the main module base address
+  #[cfg(target_os = "windows")]
+  pub fn module_base(module_name: Option<&str>, process_id: u32) -> Result<usize, Box<dyn std::error::Error>> {
+    unsafe {
+      let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id);
+      if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        return Err("Failed to create snapshot".into());
+      }
+
+      let mut module_entry: MODULEENTRY32W = std::mem::zeroed();
+      module_entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+
+      let mut success = Module32FirstW(snapshot, &mut module_entry);
+      while success != 0 {
+        if let Some(name) = module_name {
+          let wide_name: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+          if module_entry.szModule[..wide_name.len() - 1] == wide_name[..wide_name.len() - 1] {
+            CloseHandle(snapshot);
+            return Ok(module_entry.modBaseAddr as usize);
+          }
+        } else {
+          CloseHandle(snapshot);
+          return Ok(module_entry.modBaseAddr as usize);
+        }
+        success = Module32NextW(snapshot, &mut module_entry);
+      }
+
+      CloseHandle(snapshot);
+      Err("Module not found".into())
+    }
   }
 }
 
@@ -916,35 +1056,37 @@ fn get_required_nops(instr_info: &mut InstructionsInfo, jmp_size: usize) {
   instr_info.nops = length.abs_diff(jmp_size);
 }
 
-fn get_ret_jump(src_address: usize, dst_address: usize, jmp_size: usize, hook_type: HookType, instr_info: &mut InstructionsInfo, bytes_len: usize) -> usize {
-  get_required_nops(instr_info, jmp_size);
+fn get_ret_jump(src_address: usize, dst_address: usize, jmp_size: JmpSize, hook_type: HookType, instr_info: &mut InstructionsInfo, bytes_len: usize) -> usize {
+  get_required_nops(instr_info, jmp_size as usize);
   let rva_dst;
-  let mut rva_ret_jmp = src_address;
+  let mut rva_ret_jmp;
 
-  if jmp_size == 5 {
-    if src_address < (dst_address as usize) {
-      rva_dst = dst_address as usize - src_address - jmp_size;
-      rva_ret_jmp = rva_dst + instr_info.bytes.len() + jmp_size + instr_info.nops + 1;
-      if hook_type == HookType::DetourNoOrg {
-        rva_ret_jmp = rva_dst + jmp_size + instr_info.nops + 1;
-      }
-    } else {
-      rva_dst = src_address - dst_address as usize + jmp_size - 1;
-      rva_ret_jmp = rva_dst - bytes_len - instr_info.bytes.len() - jmp_size + instr_info.nops + 1;
-      if hook_type == HookType::DetourNoOrg {
-        rva_ret_jmp = rva_dst - bytes_len - jmp_size + instr_info.nops + 1;
+  match jmp_size {
+    JmpSize::Short => todo!(),
+    JmpSize::Near => {
+      if src_address < (dst_address as usize) {
+        rva_dst = dst_address as usize - src_address - jmp_size as usize;
+        rva_ret_jmp = rva_dst + instr_info.bytes.len() + jmp_size as usize + instr_info.nops + 1;
+        if hook_type == HookType::DetourNoOrg {
+          rva_ret_jmp = rva_dst + jmp_size as usize + instr_info.nops + 1;
+        }
+      } else {
+        rva_dst = src_address - dst_address as usize + jmp_size as usize - 1;
+        rva_ret_jmp = rva_dst - bytes_len - instr_info.bytes.len() - jmp_size as usize + instr_info.nops + 1;
+        if hook_type == HookType::DetourNoOrg {
+          rva_ret_jmp = rva_dst - bytes_len - jmp_size as usize + instr_info.nops + 1;
+        }
       }
     }
-  } else if jmp_size == 14 {
-    rva_ret_jmp = src_address + jmp_size + instr_info.nops;
+    JmpSize::Far => rva_ret_jmp = src_address + jmp_size as usize + instr_info.nops,
   }
 
   rva_ret_jmp
 }
 
-fn get_jmp_size(src_address: usize, dst_address: usize) -> usize {
+fn get_jmp_size(src_address: usize, dst_address: usize) -> JmpSize {
   let distance = dst_address.abs_diff(src_address);
-  if distance > i32::MAX as usize { 14 } else { 5 }
+  if distance > i32::MAX as usize { JmpSize::Far } else { JmpSize::Near }
 }
 
 fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
@@ -952,7 +1094,7 @@ fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
   let src_address = src_address as isize;
   let dst_address = dst_address as isize;
 
-  if jmp_size == 14 {
+  if jmp_size == JmpSize::Far {
     return dst_address;
   }
 
