@@ -3,7 +3,7 @@
 A low-level automated hooking library providing detours, trampolines, and memory management capabilities. Supports both internal and external process hooking with optional original code preservation.
 
 ## **THIS CRATE DEPENDS ON iced-x86**
-  **ADD iced-x86 to your cargo.toml with (features = ["code_asm"])**
+  **Add iced-x86 to your cargo.toml with (features = ["code_asm"])**
 
 ## Features
 
@@ -13,23 +13,28 @@ A low-level automated hooking library providing detours, trampolines, and memory
 - **Cross-Process Support**: Hook both internal and external processes
 - **Original Code Preservation**: Optional preservation of overwritten instructions
 - **x86/x64 Support**: Works with both 32-bit and 64-bit architectures
+- **Still in early development**
 
 
-## Warning
-   Not giving a name or providing an invalid address will result in panicing
+ # Warning
 
-   Give the hook a proper name. Name must be no less than 3 characters!
+ Not giving a name or providing an invalid address will result in panicing
 
+ Give the hook a proper name. Name must be no less than 3 characters!
+
+## To be fixed
+- **Can't use labels in assembly**
+- **Can't use variables in assembly when attached externally**
 
  # Example - Internal
 
  ```
   use hook_king::*;
-  use winapi::um::libloaderapi::GetModuleHandleA;
 
  fn internal_detour() {
-  let module_base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
+  let module_base = HookKing::module_base(None, None).unwrap();
   let mut hook_king = HookKing::default();
+
   let hook_info = HookInfo::new(
     "health",
     module_base + 0x12321,
@@ -76,19 +81,17 @@ A low-level automated hooking library providing detours, trampolines, and memory
 
  ```
   use hook_king::*;
-  use winapi::um::libloaderapi::GetModuleHandleA;
   use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
 
  fn external_detour() {
     let process_id = HookKing::process_id("NieRAutomata.exe").unwrap();
     let process = HookKing::process(process_id).unwrap();
-    let module_base = HookKing::module_base(None, process_id).unwrap();
+    let module_base = HookKing::module_base(None, Some(process_id)).unwrap();
 
     let hook_king = Arc::new(RwLock::new(HookKing::new(Some(process))));
     let hook_king_c = Arc::clone(&hook_king);
 
     let handle = std::thread::spawn(move || {
-      let module_base = unsafe { GetModuleHandleA(null_mut()) } as usize;
       let hook_info = HookInfo::new(
         "Something",
         module_base,
@@ -141,19 +144,25 @@ A low-level automated hooking library providing detours, trampolines, and memory
 
     let hook_king_r = handle.join().unwrap();
 
-    sleep(Duration::from_secs(10));
+    let hook_king_r_g = hook_king_r.read().unwrap();
 
-    let hook = hook_king_r.read().unwrap().get_hook(HookLookup::Name("Something_4".to_string()));
+    match hook_king_r_g.get_hook(HookLookup::Name("Something_4".to_string())) {
+    Some(mut v) => {
+      std::thread::sleep(Duration::from_secs(2));
+      println!("Found hook");
 
-    if hook.is_some() {
-      println!("Found the hook");
-      let mut hook = hook.unwrap();
-      sleep(Duration::from_secs(10));
+      std::thread::sleep(Duration::from_secs(5));
+      v.disable(&hook_king_r_g);
+      println!("Hook disabled");
 
-      hook.disable(&hook_king.read().unwrap());
-      sleep(Duration::from_secs(10));
-
-      hook.enable(&hook_king.read().unwrap());
+      std::thread::sleep(Duration::from_secs(5));
+      v.enable(&hook_king_r_g);
+      println!("Hook enabled");
     }
+    None => panic!(),
+  };
+
+
+
   }
  ```

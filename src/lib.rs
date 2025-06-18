@@ -1,10 +1,10 @@
 use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
 #[cfg(target_os = "windows")]
-use ntapi::ntmmapi::{MemoryBasicInformation, NtAllocateVirtualMemory, NtQueryVirtualMemory};
+use ntapi::{ntmmapi::{MemoryBasicInformation, NtAllocateVirtualMemory, NtProtectVirtualMemory, NtQueryVirtualMemory}, ntpsapi::NtCurrentProcess};
 use std::{ffi::{CString, OsStr}, os::windows::ffi::OsStrExt, sync::{Arc, OnceLock}};
 #[cfg(target_os = "windows")]
-use winapi::{shared::ntdef::NT_SUCCESS, um::{handleapi::CloseHandle, memoryapi::{ReadProcessMemory, VirtualProtectEx, VirtualQueryEx, WriteProcessMemory}, processthreadsapi::OpenProcess, tlhelp32::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS}, winnt::PROCESS_ALL_ACCESS}, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
+use winapi::{shared::ntdef::NT_SUCCESS, um::{handleapi::{CloseHandle, INVALID_HANDLE_VALUE}, memoryapi::{ReadProcessMemory, WriteProcessMemory}, processthreadsapi::{GetCurrentProcessId, OpenProcess}, tlhelp32::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS}, winnt::PROCESS_ALL_ACCESS}, um::{libloaderapi::GetModuleHandleA, processthreadsapi::GetCurrentProcess, winnt::{MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
 #[macro_export]
 macro_rules! assemble_1 {
@@ -121,7 +121,8 @@ impl HookInfo {
 
     if self.org_nops > 0 {
       let nops = hook_king.get_nop_bytes(self.org_nops);
-      hook_king.write_bytes(address, nops).unwrap();
+      let offset = jmp_size as usize;
+      hook_king.write_bytes(address + offset, nops).unwrap();
     }
 
     let offset = get_jump_offset(address, mem_address) as usize;
@@ -234,7 +235,7 @@ impl Default for Process {
 
 impl Process {
   #[cfg(target_os = "windows")]
-  pub fn get(&self) -> Option<*mut std::ffi::c_void> { if let Process::Windows(ptr) = *self { Some(ptr) } else { None } }
+  pub fn get(&self) -> *mut std::ffi::c_void { if let Process::Windows(ptr) = *self { ptr } else { NtCurrentProcess as _ } }
 
   #[cfg(target_os = "linux")]
   pub fn get(self) -> Option<u32> { if let Process::Linux(id) = self { Some(id) } else { None } }
@@ -330,7 +331,7 @@ impl HookKing {
   fn current_process() -> Process {
     #[cfg(target_os = "windows")]
     {
-      Process::Windows(unsafe { GetCurrentProcess() as _ })
+      Process::Windows(NtCurrentProcess as _)
     }
 
     #[cfg(target_os = "linux")]
@@ -381,12 +382,14 @@ impl HookKing {
 
   fn update_hook(&mut self, hook: HookInfo, index: usize) -> Result<(), Box<dyn std::error::Error>> {
     if self.hooks.contains_key(&index) {
-      self.hooks.entry(index).and_modify(|hk| {
-        hk.name = hook.name;
-        hk.address = hook.address;
-        hk.typ = hook.typ;
-        hk.assembly = hook.assembly;
-      });
+      self.hooks.insert(index, hook);
+
+      // self.hooks.entry(index).and_modify(|hk| {
+      //   hk.name = hook.name;
+      //   hk.address = hook.address;
+      //   hk.typ = hook.typ;
+      //   hk.assembly = hook.assembly;
+      // });
 
       Ok(())
     } else {
@@ -418,11 +421,11 @@ impl HookKing {
   ///
   /// ```
   ///  use hook_king::*;
-  ///  use winapi::um::libloaderapi::GetModuleHandleA;
   ///
   /// fn internal_detour() {
-  ///  let module_base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
+  ///  let module_base = HookKing::module_base(None, None).unwrap();
   ///  let mut hook_king = HookKing::default();
+  ///
   ///  let hook_info = HookInfo::new(
   ///    "health",
   ///    module_base + 0x12321,
@@ -469,19 +472,17 @@ impl HookKing {
   ///
   /// ```
   ///  use hook_king::*;
-  ///  use winapi::um::libloaderapi::GetModuleHandleA;
   ///  use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
   ///
   /// fn external_detour() {
   ///    let process_id = HookKing::process_id("NieRAutomata.exe").unwrap();
   ///    let process = HookKing::process(process_id).unwrap();
-  ///    let module_base = HookKing::module_base(None, process_id).unwrap();
+  ///    let module_base = HookKing::module_base(None, Some(process_id)).unwrap();
   ///
   ///    let hook_king = Arc::new(RwLock::new(HookKing::new(Some(process))));
   ///    let hook_king_c = Arc::clone(&hook_king);
   ///
   ///    let handle = std::thread::spawn(move || {
-  ///      let module_base = unsafe { GetModuleHandleA(null_mut()) } as usize;
   ///      let hook_info = HookInfo::new(
   ///        "Something",
   ///        module_base,
@@ -534,18 +535,26 @@ impl HookKing {
   ///
   ///    let hook_king_r = handle.join().unwrap();
   ///
-  ///    sleep(Duration::from_secs(10));
+  ///    let hook_king_r_g = hook_king_r.read().unwrap();
   ///
-  ///    let hook = hook_king_r.read().unwrap().get_hook(HookLookup::Name("Something_4".to_string()));
+  ///    match hook_king_r_g.get_hook(HookLookup::Name("Something_4".to_string())) {
+  ///    Some(mut v) => {
+  ///      std::thread::sleep(Duration::from_secs(2));
+  ///      println!("Found hook");
   ///
-  ///    if hook.is_some() {
-  ///      println!("Found the hook");
-  ///      let mut hook = hook.unwrap();
-  ///      sleep(Duration::from_secs(10));
-  ///      hook.disable(&hook_king.read().unwrap());
-  ///      sleep(Duration::from_secs(10));
-  ///      hook.enable(&hook_king.read().unwrap());
+  ///      std::thread::sleep(Duration::from_secs(5));
+  ///      v.disable(&hook_king_r_g);
+  ///      println!("Hook disabled");
+  ///
+  ///      std::thread::sleep(Duration::from_secs(5));
+  ///      v.enable(&hook_king_r_g);
+  ///      println!("Hook enabled");
   ///    }
+  ///    None => panic!(),
+  ///  };
+  ///
+  ///
+  ///
   ///  }
   /// ```
 
@@ -561,23 +570,11 @@ impl HookKing {
       panic!("Give the hook a proper name. Name must be no less than 3 characters!")
     }
 
-    let mut mbi = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-    match self.attach_typ {
-      AttachType::Internal => {
-        if unsafe { VirtualQuery(address as *const _, &mut mbi as *mut _, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || mbi.State == 0 {
-          panic!("Not a valid address! {address:#X}");
-        }
-      }
-      AttachType::External => {
-        if unsafe { VirtualQueryEx(self.process.get().unwrap() as _, address as *const _, &mut mbi as *mut _, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || mbi.State == 0 {
-          panic!("Not a valid address! {address:#X}");
-        }
-      }
+    if !self.is_valid_address(address) {
+      panic!("Not a valid address! {address:#X}");
     }
 
     if hook_type == HookType::Patch {
-      self.unprotect(address);
-
       let bytes = assemble(address, architecture, assembly)?;
       let mut org_instr_info = self.instruction_info(address, bytes.len(), architecture);
       get_required_nops(&mut org_instr_info, 0);
@@ -620,24 +617,43 @@ impl HookKing {
     Ok(())
   }
 
-  fn unprotect(&self, address: usize) {
-    let mut old_protection = 0;
-    let old_protection: *mut u32 = &mut old_protection;
+  pub fn is_valid_address(&self, address: usize) -> bool {
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut ret_len = 0;
 
+    let status = unsafe { NtQueryVirtualMemory(self.process.get() as _, address as _, MemoryBasicInformation, &mut mbi as *mut _ as _, size_of::<MEMORY_BASIC_INFORMATION>(), &mut ret_len) };
+
+    NT_SUCCESS(status) && mbi.State == winapi::um::winnt::MEM_COMMIT
+  }
+
+  // fn unprotect(&self, address: usize) {
+  //   let mut old_protection = 0;
+
+  //   unsafe {
+  //     match self.attach_typ {
+  //       AttachType::Internal => VirtualProtect(address as _, DEFAULT_BYTES_TO_READ, PAGE_EXECUTE_READWRITE, &mut old_protection),
+  //       AttachType::External => VirtualProtectEx(self.process.get().unwrap() as _, address as _, DEFAULT_BYTES_TO_READ, PAGE_EXECUTE_READWRITE, &mut old_protection),
+  //     };
+  //   }
+  // }
+
+  fn unprotect(&self, address: usize) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-      match self.attach_typ {
-        AttachType::Internal => VirtualProtect(address as _, DEFAULT_BYTES_TO_READ, PAGE_EXECUTE_READWRITE, old_protection),
-        AttachType::External => VirtualProtectEx(self.process.get().unwrap() as _, address as _, DEFAULT_BYTES_TO_READ, PAGE_EXECUTE_READWRITE, old_protection),
-      };
+      let mut address = address as _;
+      let mut size = PAGE_SIZE;
+      let mut old_protect = 0;
+
+      let status = NtProtectVirtualMemory(self.process.get() as _, &mut address, &mut size, PAGE_EXECUTE_READWRITE, &mut old_protect);
+
+      if NT_SUCCESS(status) { Ok(()) } else { Err(format!("Failed to change protection. Status: {:#X}, error: {:#X?}", status, std::io::Error::last_os_error()).into()) }
     }
   }
 
   fn write_bytes(&self, address: usize, bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
-    self.unprotect(address);
+    self.unprotect(address)?;
     match self.attach_typ {
       AttachType::Internal => {
-        let address = address as *mut u8;
-        let address = unsafe { std::slice::from_raw_parts_mut(address, bytes.len()) };
+        let address = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, bytes.len()) };
 
         for index in 0..bytes.len() {
           (*address)[index] = bytes[index];
@@ -648,28 +664,18 @@ impl HookKing {
       AttachType::External => {
         #[cfg(target_os = "windows")]
         {
-          let process = match self.process.get() {
-            Some(v) => v,
-            None => return Err("Invalid process handle".into()),
-          };
-
-          // Ensure we have a valid handle
-          if process.is_null() {
-            return Err("Null process handle".into());
-          }
-
           // Get the length of the data to write
           let size = bytes.len();
           if size == 0 {
-            return Ok(()); // Nothing to write
+            return Ok(());
           }
 
           let mut bytes_written = 0;
-          let result = unsafe { WriteProcessMemory(process as _, address as *mut _, bytes.as_ptr() as *const _, size, &mut bytes_written) };
+          let result = unsafe { WriteProcessMemory(self.process.get() as _, address as *mut _, bytes.as_ptr() as *const _, size, &mut bytes_written) };
 
           if result == 0 {
             // Failed - get last error
-            return Err(format!("WriteProcessMemory failed: {:#X?}", std::io::Error::last_os_error()).into());
+            return Err(format!("WriteProcessMemory failed, error: {:#X?}", std::io::Error::last_os_error()).into());
           }
 
           if bytes_written != size {
@@ -692,12 +698,7 @@ impl HookKing {
     let dst_address = owned_mem.address + owned_mem.used;
 
     let jmp_size = get_jmp_size(dst_address, src_address);
-    // dbg!(jmp_size);
     let rva_mem = get_jump_offset(src_address, dst_address);
-    // dbg!(rva_mem);
-    // println!("rva_mem = {:#X?}", rva_mem);
-
-    self.unprotect(src_address);
 
     // getting the instructions length covered by the jump
     let mut org_instr_info = self.instruction_info(src_address, jmp_size as usize, architecture);
@@ -750,8 +751,6 @@ impl HookKing {
       };
 
       owned_mem.inc_used(jmp_size as usize + bytes.len());
-
-      // println!("OwnedMem = {:#X?}", owned_mem);
     }
 
     hook_info.jumping_address = dst_address;
@@ -764,12 +763,10 @@ impl HookKing {
 
   /// returns the size of the original instruction(s) and required nopes if needed
   fn instruction_info(&self, address: usize, length: usize, architecture: u32) -> InstructionsInfo {
-    self.unprotect(address);
     let mut bytes = match self.read_bytes(address, length + SAFETY) {
       Ok(v) => v,
       Err(e) => panic!("Failed to read bytes bytes, at address {:#X?}, error: {:X?}", address, e),
     };
-    // println!("{:02X?}", &bytes);
 
     let mut instrs_size = 0;
     let mut opcodes = Vec::new();
@@ -801,89 +798,36 @@ impl HookKing {
   }
 
   fn read_bytes(&self, address: usize, length: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    self.unprotect(address);
-    let process = match self.attach_typ {
-      // AttachType::Internal => Ok(unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length).to_vec() }),
-      AttachType::Internal => unsafe { GetCurrentProcess() },
-      AttachType::External => self.process.get().unwrap() as _,
-    };
-
+    self.unprotect(address)?;
+    // AttachType::Internal => Ok(unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length).to_vec() }),
     let mut bytes = vec![0u8; length];
     let mut bytes_read = 0;
 
-    if unsafe { ReadProcessMemory(process, address as _, bytes.as_mut_ptr() as *mut _, length, &mut bytes_read) == 1 } { Ok(bytes) } else { Err(format!("Failed to read bytes {:#X?}", std::io::Error::last_os_error()).into()) }
+    if unsafe { ReadProcessMemory(self.process.get() as _, address as _, bytes.as_mut_ptr() as *mut _, length, &mut bytes_read) == 1 } { Ok(bytes) } else { Err(format!("Failed to read bytes, error: {:#X?}", std::io::Error::last_os_error()).into()) }
   }
 
-  // fn alloc(&self, address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
-  //   let mut memory_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-  //   let mut current_address = address;
-  //   let mut attempts = 0;
-  //   let mut new_mem = OwnedMem::default();
-
-  //   while attempts < 100000 {
-  //     let mem_query = match self.attach_typ {
-  //       AttachType::Internal => unsafe { VirtualQuery(current_address as *mut c_void, &mut memory_info as *mut MEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION>()) },
-  //       AttachType::External => unsafe { VirtualQueryEx(self.process.get().unwrap() as _, current_address as *mut c_void, &mut memory_info as *mut MEMORY_BASIC_INFORMATION, size_of::<MEMORY_BASIC_INFORMATION>()) },
-  //     };
-
-  //     let status = unsafe { NtQueryVirtualMemory(self.process.get().unwrap() as _, current_address as _, MemoryBasicInformation, &mut mem_info, mem_info_size, &mut return_length) };
-
-  //     if mem_query > 0 {
-  //       if memory_info.State == MEM_FREE && memory_info.RegionSize >= PAGE_SIZE {
-  //         let alloc_mem = match self.attach_typ {
-  //           AttachType::Internal => unsafe { VirtualAlloc(current_address as *mut c_void, PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) },
-  //           AttachType::External => unsafe { VirtualAllocEx(self.process.get().unwrap() as _, current_address as *mut c_void, PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) },
-  //         };
-
-  //         if !alloc_mem.is_null() {
-  //           let size = get_region_size(alloc_mem as usize).unwrap();
-  //           new_mem = OwnedMem { address: alloc_mem as usize, size, ..Default::default() };
-
-  //           break;
-  //         }
-  //       }
-
-  //       // match self.attach_typ {
-  //       //   AttachType::Internal => current_address = memory_info.BaseAddress as usize - memory_info.RegionSize, // Move to NEXT region (backwards traversal)
-  //       //   AttachType::External => current_address = memory_info.BaseAddress as usize + memory_info.RegionSize, // Move to NEXT region (forewards traversal)
-  //       // }
-
-  //       current_address = memory_info.BaseAddress as usize - memory_info.RegionSize; // Move to NEXT region (backwards traversal)
-  //     } else {
-  //       current_address += PAGE_SIZE;
-  //     }
-
-  //     attempts += 1;
-  //     // println!("attempts = {}", attempts);
-  //   }
-
-  //   Ok(new_mem)
-  // }
-
+  /// nt version
   fn alloc(&self, address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
     let mut mem_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let mut return_length: usize = 0;
+    let mut return_length = 0;
     let mut current_address = address;
     let mut attempts = 0;
     let mut new_mem = OwnedMem::default();
 
     while attempts < 100000 {
-      let process_handle = match self.attach_typ {
-        AttachType::Internal => unsafe { GetCurrentProcess() },
-        AttachType::External => self.process.get().unwrap() as _,
-      };
+      let process = self.process.get() as _;
 
-      let status = unsafe { NtQueryVirtualMemory(process_handle, current_address as _, MemoryBasicInformation, &mut mem_info as *mut _ as _, size_of::<MEMORY_BASIC_INFORMATION>(), &mut return_length as *mut _ as *mut _) };
+      let status = unsafe { NtQueryVirtualMemory(process, current_address as _, MemoryBasicInformation, &mut mem_info as *mut _ as _, size_of::<MEMORY_BASIC_INFORMATION>(), &mut return_length as *mut _ as *mut _) };
 
       if NT_SUCCESS(status) {
         if mem_info.State == MEM_FREE && mem_info.RegionSize >= PAGE_SIZE {
           let mut base_address = current_address as _;
           let mut region_size = PAGE_SIZE;
 
-          let alloc_status = unsafe { NtAllocateVirtualMemory(process_handle, &mut base_address, 0, &mut region_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
+          let alloc_status = unsafe { NtAllocateVirtualMemory(process, &mut base_address, 0, &mut region_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
 
           if NT_SUCCESS(alloc_status) && !base_address.is_null() {
-            let size = get_region_size(base_address as usize).unwrap();
+            let size = self.get_region_size(base_address as usize).unwrap();
             new_mem = OwnedMem { address: base_address as usize, size, ..Default::default() };
 
             break;
@@ -899,6 +843,15 @@ impl HookKing {
     }
 
     Ok(new_mem)
+  }
+
+  fn get_region_size(&self, address: usize) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut mem_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut return_length = 0;
+
+    let status = unsafe { NtQueryVirtualMemory(self.process.get() as _, address as _, MemoryBasicInformation, &mut mem_info as *mut _ as _, size_of::<MEMORY_BASIC_INFORMATION>(), &mut return_length as *mut _ as *mut _) };
+
+    if NT_SUCCESS(status) { Ok(mem_info.RegionSize) } else { Err(format!("Failed to retrieve region size, status {:#X?}, error: {:#X?}", status, std::io::Error::last_os_error()).into()) }
   }
 
   fn get_nop_bytes(&self, length: usize) -> Vec<u8> {
@@ -946,7 +899,7 @@ impl HookKing {
   #[cfg(target_os = "windows")]
   pub fn process(process_id: u32) -> Result<Process, Box<dyn std::error::Error>> {
     let process = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, process_id) };
-    if process.is_null() { Err(format!("Failed to open process, error {:#X?}", std::io::Error::last_os_error()).into()) } else { Ok(Process::Windows(process as _)) }
+    if process.is_null() { Err(format!("Failed to open process, error: {:#X?}", std::io::Error::last_os_error()).into()) } else { Ok(Process::Windows(process as _)) }
   }
 
   /// get the process_id from the name of the process
@@ -955,7 +908,7 @@ impl HookKing {
     unsafe {
       let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
       if snapshot == std::ptr::null_mut() {
-        return Err(format!("CreateToolhelp32Snapshot failed {:#X?}", std::io::Error::last_os_error()));
+        return Err(format!("CreateToolhelp32Snapshot failed, error: {:#X?}", std::io::Error::last_os_error()));
       }
 
       let mut entry: PROCESSENTRY32 = std::mem::zeroed();
@@ -963,7 +916,7 @@ impl HookKing {
 
       if Process32First(snapshot, &mut entry) == 0 {
         CloseHandle(snapshot);
-        return Err(format!("Process32First failed {:#X?}", std::io::Error::last_os_error()));
+        return Err(format!("Process32First failed, error: {:#X?}", std::io::Error::last_os_error()));
       }
 
       loop {
@@ -985,51 +938,57 @@ impl HookKing {
     }
   }
 
-  /// get the passed module base address if none it will return the main module base address
+  /// if [module_name] is none it get the main module base address of the given process.
+  ///
+  /// if [process_id] is none it looks within the currect process.
   #[cfg(target_os = "windows")]
-  pub fn module_base(module_name: Option<&str>, process_id: u32) -> Result<usize, Box<dyn std::error::Error>> {
+  pub fn module_base(module_name: Option<&str>, process_id: Option<u32>) -> Result<usize, Box<dyn std::error::Error>> {
+    let current_process = unsafe { GetCurrentProcessId() };
+    let pid = process_id.unwrap_or_else(|| current_process);
+
+    // Handle current process with GetModuleHandleA
+    if pid == current_process {
+      let name_ptr = match module_name {
+        Some(v) => CString::new(v)?.as_ptr(),
+        None => std::ptr::null(),
+      };
+      let handle = unsafe { GetModuleHandleA(name_ptr) };
+      if handle.is_null() {
+        return Err(format!("Module not found in current process, error: {:#X?}", std::io::Error::last_os_error()).into());
+      }
+      return Ok(handle as usize);
+    }
+
     unsafe {
-      let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id);
-      if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-        return Err("Failed to create snapshot".into());
+      let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+      if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!("Failed to create snapshot, error: {:#X?}", std::io::Error::last_os_error()).into());
       }
 
-      let mut module_entry: MODULEENTRY32W = std::mem::zeroed();
-      module_entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+      let mut entry: MODULEENTRY32W = std::mem::zeroed();
+      entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
 
-      let mut success = Module32FirstW(snapshot, &mut module_entry);
+      let mut success = Module32FirstW(snapshot, &mut entry);
       while success != 0 {
         if let Some(name) = module_name {
           let wide_name: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
-          if module_entry.szModule[..wide_name.len() - 1] == wide_name[..wide_name.len() - 1] {
+          let len = wide_name.len() - 1;
+          let entry_len = entry.szModule.iter().position(|&c| c == 0).unwrap_or(entry.szModule.len());
+          if entry_len == len && entry.szModule[..len] == wide_name[..len] {
             CloseHandle(snapshot);
-            return Ok(module_entry.modBaseAddr as usize);
+            return Ok(entry.modBaseAddr as usize);
           }
         } else {
           CloseHandle(snapshot);
-          return Ok(module_entry.modBaseAddr as usize);
+          return Ok(entry.modBaseAddr as usize);
         }
-        success = Module32NextW(snapshot, &mut module_entry);
+        success = Module32NextW(snapshot, &mut entry);
       }
 
       CloseHandle(snapshot);
       Err("Module not found".into())
     }
   }
-}
-
-fn module_base(module: Option<&str>) -> usize {
-  let module_name = match module {
-    Some(name) => match CString::new(name) {
-      Ok(c_str) => c_str.as_ptr(),
-      Err(_) => std::ptr::null(),
-    },
-    None => std::ptr::null(),
-  };
-
-  let handle = unsafe { GetModuleHandleA(module_name) };
-
-  handle as usize
 }
 
 fn estimate_required_size(address: usize, architecture: u32, assembly: impl Fn(&mut CodeAssembler)) -> Result<usize, Box<dyn std::error::Error>> {
@@ -1137,11 +1096,4 @@ fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn st
     return Err("Couldn't get the architecture".into());
   }
   Ok(if is_wow64 == 0 { 64 } else { 32 })
-}
-
-fn get_region_size(address: usize) -> Result<usize, Box<dyn std::error::Error>> {
-  let mut mem_info = unsafe { std::mem::zeroed() };
-  let result = unsafe { VirtualQuery(address as *mut _, &mut mem_info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
-
-  if result > 0 { Ok(mem_info.RegionSize) } else { Err("Failed to retrieve region size".into()) }
 }
