@@ -49,4 +49,4 @@ winapi = { version = "0.3.9", features = [
 [[test]]
 name = "test_exe"
 path = "tests/test_exe.rs"
-harness = false            # This allows you to write a proper main()
+harness = false            # This allows to write a proper main()
