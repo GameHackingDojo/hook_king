@@ -28,7 +28,7 @@ A low-level automated hooking library providing detours, trampolines, and memory
 
  # Example - Internal
 
- ```
+ ```rust
   use hook_king::*;
 
  fn internal_detour() {
@@ -79,7 +79,7 @@ A low-level automated hooking library providing detours, trampolines, and memory
 
  # Example - External
 
- ```
+ ```rust
   use hook_king::*;
   use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
 

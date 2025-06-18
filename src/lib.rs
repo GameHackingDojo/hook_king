@@ -419,7 +419,7 @@ impl HookKing {
   ///
   /// # Example - Internal
   ///
-  /// ```
+  /// ```rust
   ///  use hook_king::*;
   ///
   /// fn internal_detour() {
@@ -470,7 +470,7 @@ impl HookKing {
   ///
   /// # Example - External
   ///
-  /// ```
+  /// ```rust
   ///  use hook_king::*;
   ///  use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
   ///
@@ -552,8 +552,6 @@ impl HookKing {
   ///    }
   ///    None => panic!(),
   ///  };
-  ///
-  ///
   ///
   ///  }
   /// ```
