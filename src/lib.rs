@@ -417,64 +417,64 @@ impl HookKing {
   ///
   /// Give the hook a proper name. Name must be no less than 3 characters!
   ///
-  /// # Example - Internal
+  ///  # Example - Internal
   ///
-  /// ```rust
+  ///  ```rust
   ///  use hook_king::*;
   ///
-  /// fn internal_detour() {
-  ///  let module_base = HookKing::module_base(None, None).unwrap();
-  ///  let mut hook_king = HookKing::default();
+  ///  fn internal_detour() {
+  ///    let module_base = HookKing::module_base(None, None).unwrap();
+  ///    let mut hook_king = HookKing::default();
   ///
-  ///  let hook_info = HookInfo::new(
-  ///    "health",
-  ///    module_base + 0x12321,
-  ///    HookType::Detour,
-  ///    assemble!(
-  ///      push rax;
-  ///      mov rax,rcx;
-  ///      mov byte ptr [rax+50],2;
-  ///      mov word ptr [rax+50*4],2;
-  ///      mov dword ptr [rax+rax*8+50],2;
-  ///      mov qword ptr [rax],2;
-  ///      // label:
-  ///      mov rsp,rsi;
-  ///      mov r12d,4;
-  ///      mov r12w,4;
-  ///      mov r12b,4;
-  ///      mov r12b,4;
-  ///      // jmp label;
-  ///      movups xmm1,xmm0;
-  ///      sub rsp,100;
-  ///      call rax;
-  ///      call module_base as u64;
-  ///      xor al,bl;
-  ///      xorps xmm0,xmm10;
-  ///      add rsp,100;
-  ///      pop rax;
-  ///      call module_base as u64 + 0x428C16;
-  ///      jmp module_base as u64 + 0x428AAC;
-  ///      ret;
-  ///      ret;
-  ///      ret_1 1;
-  ///      mpsadbw xmm0, xmm1, 2;
-  ///      vsqrtps ymm10, dword ptr [rcx];
-  ///      // label_return:
-  ///      ret;
-  ///    )
-  ///  );
+  ///    let hook_info = HookInfo::new(
+  ///      "health",
+  ///      module_base + 0x12321,
+  ///      HookType::Detour,
+  ///      assemble!(
+  ///        push rax;
+  ///        mov rax,rcx;
+  ///        mov byte ptr [rax+50],2;
+  ///        mov word ptr [rax+50*4],2;
+  ///        mov dword ptr [rax+rax*8+50],2;
+  ///        mov qword ptr [rax],2;
+  ///        // label:
+  ///        mov rsp,rsi;
+  ///        mov r12d,4;
+  ///        mov r12w,4;
+  ///        mov r12b,4;
+  ///        mov r12b,4;
+  ///        // jmp label;
+  ///        movups xmm1,xmm0;
+  ///        sub rsp,100;
+  ///        call rax;
+  ///        call module_base as u64;
+  ///        xor al,bl;
+  ///        xorps xmm0,xmm10;
+  ///        add rsp,100;
+  ///        pop rax;
+  ///        call module_base as u64 + 0x428C16;
+  ///        jmp module_base as u64 + 0x428AAC;
+  ///        ret;
+  ///        ret;
+  ///        ret_1 1;
+  ///        mpsadbw xmm0, xmm1, 2;
+  ///        vsqrtps ymm10, dword ptr [rcx];
+  ///        // label_return:
+  ///        ret;
+  ///      ),
+  ///    );
   ///
-  ///  unsafe { hook_king.hook(hook_info).unwrap() };
-  /// }
-  /// ```
+  ///    unsafe { hook_king.hook(hook_info).unwrap() };
+  ///  }
+  ///  ```
   ///
-  /// # Example - External
+  ///  # Example - External
   ///
-  /// ```rust
+  ///  ```rust
   ///  use hook_king::*;
-  ///  use std::{sync::{Arc, RwLock}, time::Duration, thread::sleep, ptr::null_mut};
+  ///  use std::{ptr::null_mut, sync::{Arc, RwLock}, thread::sleep, time::Duration};
   ///
-  /// fn external_detour() {
+  ///  fn external_detour() {
   ///    let process_id = HookKing::process_id("NieRAutomata.exe").unwrap();
   ///    let process = HookKing::process(process_id).unwrap();
   ///    let module_base = HookKing::module_base(None, Some(process_id)).unwrap();
@@ -538,23 +538,22 @@ impl HookKing {
   ///    let hook_king_r_g = hook_king_r.read().unwrap();
   ///
   ///    match hook_king_r_g.get_hook(HookLookup::Name("Something_4".to_string())) {
-  ///    Some(mut v) => {
-  ///      std::thread::sleep(Duration::from_secs(2));
-  ///      println!("Found hook");
+  ///      Some(mut v) => {
+  ///        std::thread::sleep(Duration::from_secs(2));
+  ///        println!("Found hook");
   ///
-  ///      std::thread::sleep(Duration::from_secs(5));
-  ///      v.disable(&hook_king_r_g);
-  ///      println!("Hook disabled");
+  ///        std::thread::sleep(Duration::from_secs(5));
+  ///        v.disable(&hook_king_r_g);
+  ///        println!("Hook disabled");
   ///
-  ///      std::thread::sleep(Duration::from_secs(5));
-  ///      v.enable(&hook_king_r_g);
-  ///      println!("Hook enabled");
-  ///    }
-  ///    None => panic!(),
-  ///  };
-  ///
+  ///        std::thread::sleep(Duration::from_secs(5));
+  ///        v.enable(&hook_king_r_g);
+  ///        println!("Hook enabled");
+  ///      }
+  ///      None => panic!(),
+  ///    };
   ///  }
-  /// ```
+  ///  ```
 
   pub unsafe fn hook(&mut self, hook_info: HookInfo) -> Result<(), Box<dyn std::error::Error>> {
     let mut hook_info = hook_info;
@@ -623,17 +622,6 @@ impl HookKing {
 
     NT_SUCCESS(status) && mbi.State == winapi::um::winnt::MEM_COMMIT
   }
-
-  // fn unprotect(&self, address: usize) {
-  //   let mut old_protection = 0;
-
-  //   unsafe {
-  //     match self.attach_typ {
-  //       AttachType::Internal => VirtualProtect(address as _, DEFAULT_BYTES_TO_READ, PAGE_EXECUTE_READWRITE, &mut old_protection),
-  //       AttachType::External => VirtualProtectEx(self.process.get().unwrap() as _, address as _, DEFAULT_BYTES_TO_READ, PAGE_EXECUTE_READWRITE, &mut old_protection),
-  //     };
-  //   }
-  // }
 
   fn unprotect(&self, address: usize) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
