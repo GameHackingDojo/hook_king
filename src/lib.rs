@@ -1,10 +1,10 @@
 use dashmap::DashMap;
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock, SpecializedFormatter, SpecializedFormatterTraitOptions, code_asm::*};
-use ntapi::{ntmmapi::{MemoryBasicInformation, NtAllocateVirtualMemory, NtQueryVirtualMemory}, ntpsapi::NtCurrentProcess};
+#[cfg(target_os = "windows")]
+use ntapi::ntmmapi::{MemoryBasicInformation, NtAllocateVirtualMemory, NtQueryVirtualMemory};
 use std::{ffi::{CString, OsStr}, os::windows::ffi::OsStrExt, sync::{Arc, OnceLock}};
 #[cfg(target_os = "windows")]
-use winapi::{ctypes::c_void, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualAlloc, VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{HANDLE, MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
-use winapi::{shared::ntdef::NT_SUCCESS, um::{errhandlingapi::GetLastError, handleapi::CloseHandle, memoryapi::{ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, VirtualQueryEx, WriteProcessMemory}, processthreadsapi::OpenProcess, tlhelp32::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS}, winnt::PROCESS_ALL_ACCESS}};
+use winapi::{shared::ntdef::NT_SUCCESS, um::{handleapi::CloseHandle, memoryapi::{ReadProcessMemory, VirtualProtectEx, VirtualQueryEx, WriteProcessMemory}, processthreadsapi::OpenProcess, tlhelp32::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS}, winnt::PROCESS_ALL_ACCESS}, um::{libloaderapi::GetModuleHandleA, memoryapi::{VirtualProtect, VirtualQuery}, processthreadsapi::GetCurrentProcess, winnt::{MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE}, wow64apiset::IsWow64Process}};
 
 #[macro_export]
 macro_rules! assemble_1 {
@@ -118,13 +118,16 @@ impl HookInfo {
     let address = self.address;
     let mem_address = self.jumping_address;
     let jmp_size = get_jmp_size(self.address, self.jumping_address);
+
     if self.org_nops > 0 {
       let nops = hook_king.get_nop_bytes(self.org_nops);
       hook_king.write_bytes(address, nops).unwrap();
     }
+
     let offset = get_jump_offset(address, mem_address) as usize;
     let jmp_bytes = hook_king.get_jump_bytes(jmp_size, offset);
     hook_king.write_bytes(address, jmp_bytes).unwrap();
+
     self.enabled = true;
   }
 
@@ -157,20 +160,22 @@ pub struct OwnedMem {
 
 impl OwnedMem {
   /// increase the used memory propery
-  fn inc_used(&mut self, size: usize) -> Result<(), Box<dyn std::error::Error>> {
+  fn inc_used(&mut self, size: usize) {
     if self.used + size < self.size {
       self.used += size;
-
-      Ok(())
-    } else {
-      Err("The used size has exceeded the available size".into())
     }
   }
 
   /// ckeck given address is near the owned memory location
   fn is_nearby(&self, address: usize, jmp_size: JmpSize) -> bool {
-    const RANGE: usize = i32::MAX as usize; // 2 GB
-    self.address.abs_diff(address) <= RANGE
+    let range = match jmp_size {
+      JmpSize::None => 0,
+      JmpSize::Short => i8::MAX as usize,
+      JmpSize::Near => i32::MAX as usize,
+      JmpSize::Far => i64::MAX as usize,
+    };
+
+    self.address.abs_diff(address) <= range
   }
 
   /// check if the there is enough memory
@@ -289,8 +294,9 @@ enum AttachType {
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
 enum JmpSize {
-  Short = 2,
   #[default]
+  None = 0,
+  Short = 2,
   Near = 5,
   Far = 14,
 }
@@ -454,6 +460,7 @@ impl HookKing {
   ///      ret;
   ///    )
   ///  );
+  ///
   ///  unsafe { hook_king.hook(hook_info).unwrap() };
   /// }
   /// ```
@@ -549,7 +556,6 @@ impl HookKing {
     let hook_type = hook_info.typ;
     let assembly = hook_info.assembly.as_ref();
     let architecture = arch();
-    let module_base = module_base(None);
 
     if name.len() < 3 {
       panic!("Give the hook a proper name. Name must be no less than 3 characters!")
@@ -573,13 +579,16 @@ impl HookKing {
       self.unprotect(address);
 
       let bytes = assemble(address, architecture, assembly)?;
-      let mut instr_info = self.instruction_info(address, bytes.len(), architecture);
-      get_required_nops(&mut instr_info, 0);
+      let mut org_instr_info = self.instruction_info(address, bytes.len(), architecture);
+      get_required_nops(&mut org_instr_info, 0);
 
       self.write_bytes(address, bytes.clone())?;
 
-      let nop_bytes = self.get_nop_bytes(instr_info.nops - bytes.len());
+      let nop_bytes = self.get_nop_bytes(org_instr_info.nops - bytes.len());
       self.write_bytes(address, nop_bytes)?;
+
+      hook_info.org_bytes = org_instr_info.bytes.clone();
+      hook_info.org_nops = org_instr_info.nops;
 
       self.add_hook(hook_info.clone());
 
@@ -589,7 +598,7 @@ impl HookKing {
     let required_size = estimate_required_size(address, architecture, &assembly)?;
     let mem_index = OwnedMem::check_in_mem(address, required_size, &self.owned_mems, JmpSize::Near);
 
-    let mut mem = if let Some(index) = mem_index { self.get_mem(MemLookup::Index(index)).unwrap() } else { self.alloc(module_base)? };
+    let mut mem = if let Some(index) = mem_index { self.get_mem(MemLookup::Index(index)).unwrap() } else { self.alloc(address)? };
 
     let bytes = assemble(address, architecture, assembly)?;
     self.insert_bytes(address, architecture, &mut mem, &mut hook_info, bytes.clone())?;
@@ -639,13 +648,13 @@ impl HookKing {
       AttachType::External => {
         #[cfg(target_os = "windows")]
         {
-          let handle = match self.process.get() {
+          let process = match self.process.get() {
             Some(v) => v,
             None => return Err("Invalid process handle".into()),
           };
 
           // Ensure we have a valid handle
-          if handle.is_null() {
+          if process.is_null() {
             return Err("Null process handle".into());
           }
 
@@ -656,12 +665,11 @@ impl HookKing {
           }
 
           let mut bytes_written = 0;
-          let result = unsafe { WriteProcessMemory(handle as _, address as *mut c_void, bytes.as_ptr() as *const c_void, size, &mut bytes_written) };
+          let result = unsafe { WriteProcessMemory(process as _, address as *mut _, bytes.as_ptr() as *const _, size, &mut bytes_written) };
 
           if result == 0 {
             // Failed - get last error
-            let error = std::io::Error::last_os_error();
-            return Err(format!("WriteProcessMemory failed: {}", error).into());
+            return Err(format!("WriteProcessMemory failed: {:#X?}", std::io::Error::last_os_error()).into());
           }
 
           if bytes_written != size {
@@ -708,26 +716,40 @@ impl HookKing {
 
       // placing the hook jump
       let hook_jmp = self.get_jump_bytes(jmp_size, rva_mem as usize);
-      self.write_bytes(src_address, hook_jmp).unwrap();
+      match self.write_bytes(src_address, hook_jmp) {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to place hook jump bytes {:X?}", e),
+      }
 
       // placing nops if needed at the hooked address
       let nops = self.get_nop_bytes(org_instr_info.nops);
-      self.write_bytes(src_address + jmp_size as usize, nops).unwrap();
+      match self.write_bytes(src_address + jmp_size as usize, nops) {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to place nops bytes, error: {:X?}", e),
+      };
 
       // placing the injected bytes
-      self.write_bytes(dst_address, bytes.clone())?;
+      match self.write_bytes(dst_address, bytes.clone()) {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to place injected bytes, error: {:X?}", e),
+      };
 
       if hook_info.typ == HookType::Detour {
-        self.write_bytes(dst_address + bytes.len(), org_instr_info.bytes.clone())?;
-        owned_mem.inc_used(org_instr_info.bytes.len()).unwrap();
+        match self.write_bytes(dst_address + bytes.len(), org_instr_info.bytes.clone()) {
+          Ok(_) => (),
+          Err(e) => panic!("Failed to place original bytes, error: {:X?}", e),
+        };
+        owned_mem.inc_used(org_instr_info.bytes.len());
       }
 
       // placing the return jump
       let ret_jmp_bytes = self.get_jump_bytes(jmp_size, rva_ret_jmp);
-      self.write_bytes(ret_address_jump, ret_jmp_bytes).unwrap();
+      match self.write_bytes(ret_address_jump, ret_jmp_bytes) {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to place return jump bytes, error: {:X?}", e),
+      };
 
-      owned_mem.inc_used(bytes.len()).unwrap();
-      owned_mem.inc_used(jmp_size as usize).unwrap();
+      owned_mem.inc_used(jmp_size as usize + bytes.len());
 
       // println!("OwnedMem = {:#X?}", owned_mem);
     }
@@ -743,11 +765,14 @@ impl HookKing {
   /// returns the size of the original instruction(s) and required nopes if needed
   fn instruction_info(&self, address: usize, length: usize, architecture: u32) -> InstructionsInfo {
     self.unprotect(address);
-    let mut bytes = self.read_bytes(address, DEFAULT_BYTES_TO_READ).unwrap();
+    let mut bytes = match self.read_bytes(address, length + SAFETY) {
+      Ok(v) => v,
+      Err(e) => panic!("Failed to read bytes bytes, at address {:#X?}, error: {:X?}", address, e),
+    };
     // println!("{:02X?}", &bytes);
+
     let mut instrs_size = 0;
     let mut opcodes = Vec::new();
-
     let mut decoder = Decoder::with_ip(architecture, &bytes, address as u64, DecoderOptions::NONE);
     let mut formatter = SpecializedFormatter::<MyTraitOptions>::new();
     let mut formated_instr = String::new();
@@ -776,18 +801,17 @@ impl HookKing {
   }
 
   fn read_bytes(&self, address: usize, length: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    match self.attach_typ {
-      AttachType::Internal => Ok(unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length).to_vec() }),
-      AttachType::External => {
-        let Process::Windows(process) = self.process else {
-          return Err("Invalid process handle".into());
-        };
-        let mut bytes = vec![0u8; length];
-        let mut bytes_read = 0;
+    self.unprotect(address);
+    let process = match self.attach_typ {
+      // AttachType::Internal => Ok(unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length).to_vec() }),
+      AttachType::Internal => unsafe { GetCurrentProcess() },
+      AttachType::External => self.process.get().unwrap() as _,
+    };
 
-        if unsafe { ReadProcessMemory(process as _, address as _, bytes.as_mut_ptr() as *mut _, length, &mut bytes_read) == 1 } { Ok(bytes) } else { Err(format!("Failed to read bytes {:X?}", unsafe { GetLastError() }).into()) }
-      }
-    }
+    let mut bytes = vec![0u8; length];
+    let mut bytes_read = 0;
+
+    if unsafe { ReadProcessMemory(process, address as _, bytes.as_mut_ptr() as *mut _, length, &mut bytes_read) == 1 } { Ok(bytes) } else { Err(format!("Failed to read bytes {:#X?}", std::io::Error::last_os_error()).into()) }
   }
 
   // fn alloc(&self, address: usize) -> Result<OwnedMem, Box<dyn std::error::Error>> {
@@ -845,7 +869,7 @@ impl HookKing {
 
     while attempts < 100000 {
       let process_handle = match self.attach_typ {
-        AttachType::Internal => NtCurrentProcess,
+        AttachType::Internal => unsafe { GetCurrentProcess() },
         AttachType::External => self.process.get().unwrap() as _,
       };
 
@@ -859,7 +883,7 @@ impl HookKing {
           let alloc_status = unsafe { NtAllocateVirtualMemory(process_handle, &mut base_address, 0, &mut region_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
 
           if NT_SUCCESS(alloc_status) && !base_address.is_null() {
-            let size = get_region_size(base_address as usize).unwrap(); // assuming your function works the same
+            let size = get_region_size(base_address as usize).unwrap();
             new_mem = OwnedMem { address: base_address as usize, size, ..Default::default() };
 
             break;
@@ -892,9 +916,11 @@ impl HookKing {
     let mut bytes = Vec::new();
 
     match jmp_size {
-      JmpSize::Short => todo!(),
+      JmpSize::None => return bytes,
+      JmpSize::Short => bytes.extend_from_slice(&[0xEB, offset as u8]),
       JmpSize::Near => {
         bytes.push(0xE9);
+
         let mut v = offset;
         for _ in 0..4 {
           bytes.push(v as u8);
@@ -920,7 +946,7 @@ impl HookKing {
   #[cfg(target_os = "windows")]
   pub fn process(process_id: u32) -> Result<Process, Box<dyn std::error::Error>> {
     let process = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, process_id) };
-    if process.is_null() { Err(format!("Failed to open process, error {:X?}", unsafe { GetLastError() }).into()) } else { Ok(Process::Windows(process as _)) }
+    if process.is_null() { Err(format!("Failed to open process, error {:#X?}", std::io::Error::last_os_error()).into()) } else { Ok(Process::Windows(process as _)) }
   }
 
   /// get the process_id from the name of the process
@@ -929,7 +955,7 @@ impl HookKing {
     unsafe {
       let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
       if snapshot == std::ptr::null_mut() {
-        return Err(format!("CreateToolhelp32Snapshot failed {:X?}", GetLastError()));
+        return Err(format!("CreateToolhelp32Snapshot failed {:#X?}", std::io::Error::last_os_error()));
       }
 
       let mut entry: PROCESSENTRY32 = std::mem::zeroed();
@@ -937,7 +963,7 @@ impl HookKing {
 
       if Process32First(snapshot, &mut entry) == 0 {
         CloseHandle(snapshot);
-        return Err(format!("Process32First failed {:X?}", GetLastError()));
+        return Err(format!("Process32First failed {:#X?}", std::io::Error::last_os_error()));
       }
 
       loop {
@@ -991,8 +1017,6 @@ impl HookKing {
     }
   }
 }
-
-fn process() -> HANDLE { unsafe { GetCurrentProcess() } }
 
 fn module_base(module: Option<&str>) -> usize {
   let module_name = match module {
@@ -1062,6 +1086,7 @@ fn get_ret_jump(src_address: usize, dst_address: usize, jmp_size: JmpSize, hook_
   let mut rva_ret_jmp;
 
   match jmp_size {
+    JmpSize::None => todo!(),
     JmpSize::Short => todo!(),
     JmpSize::Near => {
       if src_address < (dst_address as usize) {
@@ -1103,7 +1128,7 @@ fn get_jump_offset(src_address: usize, dst_address: usize) -> isize {
 
 static ARCHITECTURE: OnceLock<u32> = OnceLock::new();
 
-fn arch() -> u32 { *ARCHITECTURE.get_or_init(|| get_architecture(process()).unwrap_or(64)) }
+fn arch() -> u32 { *ARCHITECTURE.get_or_init(|| get_architecture(unsafe { GetCurrentProcess() }).unwrap_or(64)) }
 
 fn get_architecture(handle: winapi::um::winnt::HANDLE) -> Result<u32, Box<dyn std::error::Error>> {
   let mut is_wow64 = 0;
